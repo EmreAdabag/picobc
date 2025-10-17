@@ -21,7 +21,7 @@ def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 10.
     all_frames = []  # list of T_i x H x W x C uint8 tensors
     episodes_meta = []
     env = PickAndPlaceEnv(seed=123)
-    max_steps = timeout_s / env.dt
+    max_steps = int(timeout_s / env.dt)
     for ep in range(episodes):
         env.reset(record_video=render_video)
         # Align image/state timing with training (frames were captured post-step)
