@@ -5,7 +5,7 @@ from env import PickAndPlaceEnv, ExpertController, collect_expert_dataset
 def run_episode(max_steps: int = 500):
     env = PickAndPlaceEnv()
     ctrl = ExpertController()
-    for ep in range(10):
+    for ep in range(1):
         env.reset(record_video=True)
         for t in range(max_steps):
             u = ctrl.act(env)
@@ -22,4 +22,4 @@ def run_episode(max_steps: int = 500):
 if __name__ == "__main__":
     # run_episode()
     if 1:
-        collect_expert_dataset(20000, "expert_multitask_20k.h5")
+        collect_expert_dataset(200, "expert_highfidelity_200.h5")

@@ -1,7 +1,7 @@
 import os
 import json
 import torch
-import torchvision
+from tqdm import tqdm
 from torchvision.io import write_video
 
 class PickAndPlaceEnv:
@@ -26,7 +26,7 @@ class PickAndPlaceEnv:
         self.exclude_combo = exclude_combo
 
         # World and physics constants (fixed; minimal, no configuration)
-        self.dt = torch.tensor(0.05, device=self.device, dtype=self.dtype)
+        self.dt = torch.tensor(0.0025, device=self.device, dtype=self.dtype)
         self.mass = torch.tensor(1.0, device=self.device, dtype=self.dtype)
 
         # Geometry (fixed)
@@ -301,6 +301,7 @@ class PickAndPlaceEnv:
 
         Requires `reset(record_video=True)` before stepping to collect frames.
         """
+        fps = int(1 / self.dt)
         if not self._frames:
             raise RuntimeError("No frames recorded. Call reset(record_video=True) and step().")
 
@@ -311,11 +312,11 @@ class PickAndPlaceEnv:
         info = self.command_info()
         target_path = path
         # write_video expects CxHxW or HxWxC? In torchvision>=0.14, it expects T x H x W x C uint8
-        write_video(filename=target_path, video_array=frames, fps=30)
+        write_video(filename=target_path, video_array=frames, fps=fps)
 
         sidecar = {
             "video_path": target_path,
-            "fps": int(30),
+            "fps": int(fps),
             "command": info,
         }
         sidecar_path = os.path.splitext(target_path)[0] + ".json"
@@ -356,7 +357,7 @@ class ExpertController:
         return u
 
 
-def collect_expert_dataset(N: int, path: str, max_steps: int = 500):
+def collect_expert_dataset(N: int, path: str):
     """
     Collect N expert demonstrations and save to an HDF5 file.
 
@@ -377,8 +378,10 @@ def collect_expert_dataset(N: int, path: str, max_steps: int = 500):
     env = PickAndPlaceEnv()
     ctrl = ExpertController()
 
+    total_samples = 0
+
     with h5py.File(path, "w") as f:
-        for i in range(int(N)):
+        for i in tqdm(range(int(N))):
             env.reset(record_video=False)
 
             frames = []
@@ -388,7 +391,7 @@ def collect_expert_dataset(N: int, path: str, max_steps: int = 500):
             obj_poss = []
             goal_centers = []
 
-            for t in range(int(max_steps)):
+            while 1:
                 u = ctrl.act(env)
                 out = env.step(u)
                 frames.append(env.current_frame().to("cpu"))
@@ -417,3 +420,7 @@ def collect_expert_dataset(N: int, path: str, max_steps: int = 500):
             g.create_dataset("goal_center", data=goal_centers_t)
             # Store episode command as a 2-vector [object_color, goal_color]
             g.create_dataset("command", data=env.command.to(torch.float32).cpu().numpy())
+
+            total_samples += len(frames_t)
+    
+    print(f"wrote {total_samples * env.dt / 3600} hours of data from {N} demonstrations totalling {total_samples} datapoints")

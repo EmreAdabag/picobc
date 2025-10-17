@@ -1,4 +1,5 @@
 import os
+import math
 import argparse
 import h5py
 import numpy as np
@@ -8,6 +9,9 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from bc_model import BCModel
 from rollout import rollout as eval_rollout
+import wandb
+
+USE_WANDB=0
 
 
 class HDF5DeltaDataset(Dataset):
@@ -71,14 +75,31 @@ class HDF5DeltaDataset(Dataset):
 @torch.no_grad()
 def _eval_closed_loop_using_rollout(model: BCModel, episodes: int = 10, max_steps: int = 300) -> tuple[int, int]:
     # Directly evaluate the in-memory model without saving, no videos
-    successes = eval_rollout(model, episodes=episodes, out_dir='ckpts', max_steps=max_steps, render_video=False)
+    successes = eval_rollout(model, episodes=episodes, max_steps=max_steps, render_video=False)
     # Ensure training mode after eval
     model.train()
     return successes, int(episodes)
 
 
-def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 64, lr: float = 1e-4, resume: str | None = None, backbone_ckpt: str | None = None, num_demos: int = 0):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def train(dataset_path: str, out_path: str, steps: int, batch_size: int, lr: float, resume: str | None, backbone_ckpt: str | None, num_demos: int):
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    if USE_WANDB:
+        wandb.init(project=os.environ.get('WANDB_PROJECT', 'mcdonalds'), config={
+            'data': dataset_path,
+            'out': out_path,
+            'steps': steps,
+            'batch_size': batch_size,
+            'lr': lr,
+            'resume': resume,
+            'backbone_ckpt': backbone_ckpt,
+            'num_demos': num_demos,
+            'device': str(device),
+        })
+
+    # Ensure output directory exists (treat out_path as directory)
+    out_dir = out_path
+    os.makedirs(out_dir, exist_ok=True)
 
     ds = HDF5DeltaDataset(dataset_path, num_demos=num_demos)
     N = len(ds)
@@ -87,14 +108,18 @@ def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 6
     train_ds, val_ds = random_split(ds, [train_size, val_size])
 
     # Use conservative num_workers to avoid h5py file handle issues
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=torch.cuda.is_available())
-    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=torch.cuda.is_available())
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=16, pin_memory=torch.cuda.is_available())
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=torch.cuda.is_available())
 
     print(f"dataset size: {N} | train: {train_size} | val: {val_size} | batch size: {batch_size}")
+    if USE_WANDB:
+        wandb.config.update({'dataset_size': N, 'train_size': train_size, 'val_size': val_size}, allow_val_change=True)
 
     model = BCModel().to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"trainable params: {n_params}")
+    if USE_WANDB:
+        wandb.config.update({'trainable_params': int(n_params)}, allow_val_change=True)
     
     if backbone_ckpt:
         b_state = torch.load(backbone_ckpt, map_location=device)
@@ -112,6 +137,9 @@ def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 6
 
     model.train()
     best_val = float('inf')
+    global_step = 0
+    steps_per_epoch = math.ceil(train_size / batch_size)
+    epochs = int(batch_size * steps // train_size)
     for ep in range(epochs):
         global_ep = ep + 1
         total = 0.0
@@ -130,7 +158,14 @@ def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 6
 
             total += loss.item() * img.size(0)
             count += img.size(0)
-        print(f"epoch {global_ep}/{epochs} | loss={total/max(1,count):.6f}")
+
+            global_step += 1
+            if global_step % 5 == 0:
+                if USE_WANDB:
+                    wandb.log({'train/loss': loss.item(), 'epoch': global_ep}, step=global_step)
+
+        train_loss = total/max(1,count)
+        print(f"epoch {global_ep}/{epochs} | loss={train_loss:.6f}")
         # Validation
         if len(val_dl) > 0:
             model.eval()
@@ -145,36 +180,40 @@ def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 6
                     v_total += nn.functional.mse_loss(pred, dpos, reduction='sum').item()
                     v_count += img.size(0)
                 val_loss = v_total / max(1, v_count)
-            print(f"           val_loss={val_loss:.6f}")
+            print(f"val_loss={val_loss:.6f}")
+            if USE_WANDB:
+                wandb.log({'val/loss': val_loss, 'epoch': global_ep}, step=global_step)
             if val_loss < best_val:
                 best_val = val_loss
-                best_path = f"best_{out_path}"
+                best_path = os.path.join(out_dir, "best.pt")
                 torch.save(model.state_dict(), best_path)
         model.train()
-        if (global_ep) % 10 == 0:
-            ckpt_path = f"ckpts/checkpoint_ep{global_ep}.pt"
+        if (global_step) // 1000 != (global_step - steps_per_epoch) // 1000:
+            ckpt_path = os.path.join(out_dir, f"checkpoint_ep{global_ep}.pt")
             torch.save(model.state_dict(), ckpt_path)
-            # Closed-loop evaluation (no video), report success rate
-            s, tot = _eval_closed_loop_using_rollout(model, episodes=10, max_steps=300)
+            s, tot = _eval_closed_loop_using_rollout(model, episodes=100, max_steps=250)
             rate = s / max(1, tot)
             print(f"closed-loop eval @epoch {global_ep}: success {s}/{tot} (rate={rate:.2f})")
+            if USE_WANDB:
+                wandb.log({'eval/success_rate': rate, 'epoch': global_ep}, step=global_step)
 
-    torch.save(model.state_dict(), out_path)
-    print(f"saved model to {out_path}")
+    final_path = os.path.join(out_dir, "final.pt")
+    torch.save(model.state_dict(), final_path)
+    print(f"saved final checkpoint to {final_path}")
+    if USE_WANDB:
+        wandb.finish()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, required=True, help='Path to HDF5 dataset')
-    parser.add_argument('--out', type=str, default='bc_model.pt', help='Output path for model weights')
-    parser.add_argument('--epochs', type=int, default=10000)
+    parser.add_argument('--out', type=str, default='ckpts', help='Output directory for checkpoints')
+    parser.add_argument('--steps', type=int, default=10000)
     parser.add_argument('--batch_size', type=int, default=256)
+    parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--resume', type=str, default=None, help='Path to model checkpoint to initialize from')
     parser.add_argument('--backbone_ckpt', type=str, default=None, help='Checkpoint for backbone')
     parser.add_argument('--num_demos', type=int, default=0, help='Number of demonstrations to use before split (0 = all)')
     args = parser.parse_args()
 
-    print(f"dataset: {args.data} | out: {args.out} | epochs: {args.epochs} | batch_size: {args.batch_size} | resume: {args.resume} | backbone_ckpt: {args.backbone_ckpt} | num_demos: {args.num_demos}")
-    os.makedirs('ckpts', exist_ok=True)
-
-    train(args.data, args.out, epochs=args.epochs, batch_size=args.batch_size, resume=args.resume, backbone_ckpt=args.backbone_ckpt, num_demos=args.num_demos)
+    train(args.data, args.out, steps=args.steps, batch_size=args.batch_size, lr=args.lr, resume=args.resume, backbone_ckpt=args.backbone_ckpt, num_demos=args.num_demos)

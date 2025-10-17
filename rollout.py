@@ -8,7 +8,7 @@ from env import PickAndPlaceEnv
 
 
 @torch.no_grad()
-def rollout(model, episodes: int = 2, out_dir: str = ".", max_steps: int = 300, render_video: bool = True, device=None):
+def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 10., render_video: bool = True, device=None):
     # Preserve caller's mode and ensure restoration after eval
     prev_training = model.training
     model.eval()
@@ -21,6 +21,7 @@ def rollout(model, episodes: int = 2, out_dir: str = ".", max_steps: int = 300, 
     all_frames = []  # list of T_i x H x W x C uint8 tensors
     episodes_meta = []
     env = PickAndPlaceEnv(seed=123)
+    max_steps = timeout_s / env.dt
     for ep in range(episodes):
         env.reset(record_video=render_video)
         # Align image/state timing with training (frames were captured post-step)
