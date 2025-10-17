@@ -7,47 +7,65 @@ import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from bc_model import BCModel
-from rollout_bc import rollout as eval_rollout
+from rollout import rollout as eval_rollout
 
 
 class HDF5DeltaDataset(Dataset):
-    """Preloads all samples into memory for fast iteration."""
-    def __init__(self, path: str):
-        super().__init__()
-        imgs = []
-        states = []
-        dposes = []
+    """Streams transitions from an HDF5 file without preloading everything into RAM.
 
-        with h5py.File(path, 'r') as f:
-            for k in f.keys():
+    Builds an index of (group_key, t) pairs where each item corresponds to a
+    transition (t -> t+1). Each __getitem__ opens the HDF5 file and reads just
+    the necessary slices to construct a single sample.
+    """
+    def __init__(self, path: str, num_demos: int = 0):
+        super().__init__()
+        self.path = path
+        self._index: list[tuple[str, int]] = []
+
+        groups = None
+        if num_demos > 0:
+            with h5py.File(path, 'r') as f:
+                all_groups = list(f.keys())
+            assert num_demos <= len(all_groups)
+            rng = np.random.default_rng()
+            rng.shuffle(all_groups)
+            groups = all_groups[:num_demos]
+
+        # Pre-scan groups to build a flat index of transitions
+        with h5py.File(self.path, 'r') as f:
+            keys = list(f.keys()) if groups is None else list(groups)
+            for k in keys:
                 g = f[k]
-                images = g['images'][...]          # TxHxWx3 uint8
-                pos = g['agent_pos'][...]          # Tx2
-                vel = g['agent_vel'][...]          # Tx2
-                T = images.shape[0]
+                if 'images' not in g or 'agent_pos' not in g or 'command' not in g:
+                    continue
+                T = int(g['images'].shape[0])
                 if T < 2:
                     continue
-                # Build (t -> t+1) pairs
-                imgs.append(images[:-1])           # (T-1)xHxWx3
-                # st = np.concatenate([pos[:-1], vel[:-1]], axis=-1)  # (T-1)x4
-                st = pos[:-1]
-                states.append(st)
-                dposes.append(pos[1:] - pos[:-1])  # (T-1)x2
-
-        imgs = np.concatenate(imgs, axis=0)            # NxHxWx3
-        states = np.concatenate(states, axis=0)        # Nx4
-        dposes = np.concatenate(dposes, axis=0)        # Nx2
-
-        # Convert once to tensors
-        self.imgs = torch.from_numpy(imgs).permute(0, 3, 1, 2).float().div_(255.0).contiguous()
-        self.states = torch.from_numpy(states).float().contiguous()
-        self.dpos = torch.from_numpy(dposes).float().contiguous()
+                # For episode group k, valid transition timesteps are 0..T-2
+                for t in range(T - 1):
+                    self._index.append((k, t))
 
     def __len__(self):
-        return self.imgs.size(0)
+        return len(self._index)
 
     def __getitem__(self, idx):
-        return self.imgs[idx], self.states[idx], self.dpos[idx]
+        ep_key, t = self._index[idx]
+        # Read exactly one transition worth of data
+        with h5py.File(self.path, 'r') as f:
+            g = f[ep_key]
+            # Single frame and state at t, and next pos at t+1
+            img = g['images'][t]                 # HxWx3 uint8
+            pos_t = g['agent_pos'][t]            # 2
+            pos_tp1 = g['agent_pos'][t + 1]      # 2
+            cmd = g['command'][...]              # 2
+
+        # Prepare tensors
+        img_t = torch.from_numpy(img).permute(2, 0, 1).float().div_(255.0).contiguous()   # 3xHxW
+        state_t = torch.from_numpy(pos_t).float().contiguous()                              # 2
+        cmd_t = torch.from_numpy(cmd).float().contiguous()                                  # 2
+        dpos = torch.from_numpy(pos_tp1 - pos_t).float().contiguous()                       # 2
+
+        return img_t, state_t, cmd_t, dpos
 
 
 @torch.no_grad()
@@ -59,28 +77,25 @@ def _eval_closed_loop_using_rollout(model: BCModel, episodes: int = 10, max_step
     return successes, int(episodes)
 
 
-def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 64, lr: float = 1e-4, resume: str | None = None, backbone_ckpt: str | None = None):
+def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 64, lr: float = 1e-4, resume: str | None = None, backbone_ckpt: str | None = None, num_demos: int = 0):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ds = HDF5DeltaDataset(dataset_path)
+
+    ds = HDF5DeltaDataset(dataset_path, num_demos=num_demos)
     N = len(ds)
     val_size = max(1, int(round(0.1 * N))) if N > 0 else 0
     train_size = max(0, N - val_size)
-    if N > 0 and train_size == 0:
-        train_size = N - 1
-        val_size = 1
-    if N > 0:
-        train_ds, val_ds = random_split(ds, [train_size, val_size])
-    else:
-        train_ds, val_ds = ds, ds
+    train_ds, val_ds = random_split(ds, [train_size, val_size])
 
+    # Use conservative num_workers to avoid h5py file handle issues
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=torch.cuda.is_available())
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=torch.cuda.is_available())
 
     print(f"dataset size: {N} | train: {train_size} | val: {val_size} | batch size: {batch_size}")
 
     model = BCModel().to(device)
-    # Optionally initialize only the ResNet backbone from a prior BCModel checkpoint saved by this script.
-    # This assumes keys are prefixed with 'backbone.'. If format mismatches, let it crash.
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"trainable params: {n_params}")
+    
     if backbone_ckpt:
         b_state = torch.load(backbone_ckpt, map_location=device)
         filtered = {k[len('backbone.'):]: v for k, v in b_state.items() if k.startswith('backbone.')}
@@ -91,6 +106,7 @@ def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 6
         state = torch.load(resume, map_location=device)
         model.load_state_dict(state)
         print(f"loaded checkpoint from {resume}")
+    
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
 
@@ -100,13 +116,14 @@ def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 6
         global_ep = ep + 1
         total = 0.0
         count = 0
-        for img, state, dpos in tqdm(train_dl, desc=f"epoch {global_ep}/{epochs}"):
+        for img, state, cmd, dpos in tqdm(train_dl, desc=f"epoch {global_ep}/{epochs}"):
             img = img.to(device)
             state = state.to(device)
+            cmd = cmd.to(device)
             dpos = dpos.to(device)
 
             opt.zero_grad(set_to_none=True)
-            pred = model(img, state)
+            pred = model(img, state, cmd)
             loss = loss_fn(pred, dpos)
             loss.backward()
             opt.step()
@@ -119,11 +136,12 @@ def train(dataset_path: str, out_path: str, epochs: int = 5, batch_size: int = 6
             model.eval()
             with torch.no_grad():
                 v_total, v_count = 0.0, 0
-                for img, state, dpos in val_dl:
+                for img, state, cmd, dpos in val_dl:
                     img = img.to(device)
                     state = state.to(device)
+                    cmd = cmd.to(device)
                     dpos = dpos.to(device)
-                    pred = model(img, state)
+                    pred = model(img, state, cmd)
                     v_total += nn.functional.mse_loss(pred, dpos, reduction='sum').item()
                     v_count += img.size(0)
                 val_loss = v_total / max(1, v_count)
@@ -153,8 +171,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--resume', type=str, default=None, help='Path to model checkpoint to initialize from')
     parser.add_argument('--backbone_ckpt', type=str, default=None, help='Checkpoint for backbone')
+    parser.add_argument('--num_demos', type=int, default=0, help='Number of demonstrations to use before split (0 = all)')
     args = parser.parse_args()
 
+    print(f"dataset: {args.data} | out: {args.out} | epochs: {args.epochs} | batch_size: {args.batch_size} | resume: {args.resume} | backbone_ckpt: {args.backbone_ckpt} | num_demos: {args.num_demos}")
     os.makedirs('ckpts', exist_ok=True)
 
-    train(args.data, args.out, epochs=args.epochs, batch_size=args.batch_size, resume=args.resume, backbone_ckpt=args.backbone_ckpt)
+    train(args.data, args.out, epochs=args.epochs, batch_size=args.batch_size, resume=args.resume, backbone_ckpt=args.backbone_ckpt, num_demos=args.num_demos)
