@@ -15,16 +15,14 @@ USE_WANDB=0
 
 
 class HDF5DeltaDataset(Dataset):
-    """Streams transitions from an HDF5 file without preloading everything into RAM.
+    """Loads all transitions from HDF5 into RAM for fast access.
 
-    Builds an index of (group_key, t) pairs where each item corresponds to a
-    transition (t -> t+1). Each __getitem__ opens the HDF5 file and reads just
-    the necessary slices to construct a single sample.
+    Preloads all data as numpy arrays (uint8 for images to save memory).
+    Converts to tensors on-the-fly in __getitem__.
     """
     def __init__(self, path: str, num_demos: int = 0):
         super().__init__()
-        self.path = path
-        self._index: list[tuple[str, int]] = []
+        self.data = []  # List of (img_uint8, pos_t, pos_tp1, cmd) tuples
 
         groups = None
         if num_demos > 0:
@@ -35,35 +33,42 @@ class HDF5DeltaDataset(Dataset):
             rng.shuffle(all_groups)
             groups = all_groups[:num_demos]
 
-        # Pre-scan groups to build a flat index of transitions
-        with h5py.File(self.path, 'r') as f:
+        # Load all data into memory
+        print(f"Loading HDF5 file into memory: {path}")
+        with h5py.File(path, 'r') as f:
             keys = list(f.keys()) if groups is None else list(groups)
-            for k in keys:
+            for k in tqdm(keys, desc="Loading episodes"):
                 g = f[k]
                 if 'images' not in g or 'agent_pos' not in g or 'command' not in g:
                     continue
-                T = int(g['images'].shape[0])
+                
+                # Load entire episode at once
+                images = np.array(g['images'])       # TxHxWx3 uint8
+                agent_pos = np.array(g['agent_pos']) # Tx2 float
+                command = np.array(g['command'])     # 2 float
+                
+                T = images.shape[0]
                 if T < 2:
                     continue
-                # For episode group k, valid transition timesteps are 0..T-2
+                
+                # Store all transitions
                 for t in range(T - 1):
-                    self._index.append((k, t))
+                    self.data.append((
+                        images[t],        # HxWx3 uint8
+                        agent_pos[t],     # 2
+                        agent_pos[t + 1], # 2
+                        command           # 2
+                    ))
+        
+        print(f"Loaded {len(self.data)} transitions into memory")
 
     def __len__(self):
-        return len(self._index)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        ep_key, t = self._index[idx]
-        # Read exactly one transition worth of data
-        with h5py.File(self.path, 'r') as f:
-            g = f[ep_key]
-            # Single frame and state at t, and next pos at t+1
-            img = g['images'][t]                 # HxWx3 uint8
-            pos_t = g['agent_pos'][t]            # 2
-            pos_tp1 = g['agent_pos'][t + 1]      # 2
-            cmd = g['command'][...]              # 2
-
-        # Prepare tensors
+        img, pos_t, pos_tp1, cmd = self.data[idx]
+        
+        # Convert from numpy to tensor
         img_t = torch.from_numpy(img).permute(2, 0, 1).float().div_(255.0).contiguous()   # 3xHxW
         state_t = torch.from_numpy(pos_t).float().contiguous()                              # 2
         cmd_t = torch.from_numpy(cmd).float().contiguous()                                  # 2
@@ -107,9 +112,12 @@ def train(dataset_path: str, out_path: str, steps: int, batch_size: int, lr: flo
     train_size = max(0, N - val_size)
     train_ds, val_ds = random_split(ds, [train_size, val_size])
 
-    # Use conservative num_workers to avoid h5py file handle issues
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=16, pin_memory=torch.cuda.is_available())
-    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=16, pin_memory=torch.cuda.is_available())
+    # Data is in memory, use fewer workers to avoid serialization overhead
+    num_workers = 4
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, 
+                          pin_memory=torch.cuda.is_available())
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, 
+                        pin_memory=torch.cuda.is_available())
 
     print(f"dataset size: {N} | train: {train_size} | val: {val_size} | batch size: {batch_size}")
     if USE_WANDB:
