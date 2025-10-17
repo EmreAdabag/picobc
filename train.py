@@ -73,9 +73,9 @@ class HDF5DeltaDataset(Dataset):
 
 
 @torch.no_grad()
-def _eval_closed_loop_using_rollout(model: BCModel, episodes: int = 10, max_steps: int = 300) -> tuple[int, int]:
+def _eval_closed_loop_using_rollout(model: BCModel, episodes: int = 10, timeout_s: float = 5.0) -> tuple[int, int]:
     # Directly evaluate the in-memory model without saving, no videos
-    successes = eval_rollout(model, episodes=episodes, max_steps=max_steps, render_video=False)
+    successes = eval_rollout(model, episodes=episodes, timeout_s=timeout_s, render_video=False)
     # Ensure training mode after eval
     model.train()
     return successes, int(episodes)
@@ -191,7 +191,7 @@ def train(dataset_path: str, out_path: str, steps: int, batch_size: int, lr: flo
         if (global_step) // 1000 != (global_step - steps_per_epoch) // 1000:
             ckpt_path = os.path.join(out_dir, f"checkpoint_ep{global_ep}.pt")
             torch.save(model.state_dict(), ckpt_path)
-            s, tot = _eval_closed_loop_using_rollout(model, episodes=100, max_steps=250)
+            s, tot = _eval_closed_loop_using_rollout(model, episodes=100, timeout_s=5.0)
             rate = s / max(1, tot)
             print(f"closed-loop eval @epoch {global_ep}: success {s}/{tot} (rate={rate:.2f})")
             if USE_WANDB:
