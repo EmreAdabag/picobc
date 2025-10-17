@@ -1,3 +1,5 @@
+import os
+import json
 import torch
 import torchvision
 from torchvision.io import write_video
@@ -34,10 +36,12 @@ class PickAndPlaceEnv:
             torch.tensor([69, 123, 157], device=self.device, dtype=torch.uint8),   # blue-ish
             torch.tensor([255, 140, 0], device=self.device, dtype=torch.uint8),    # orange
         ]
+        self.object_color_names = ["blue", "orange"]
         self.goal_colors = [
             torch.tensor([29, 185, 84], device=self.device, dtype=torch.uint8),    # green-ish
             torch.tensor([155, 89, 182], device=self.device, dtype=torch.uint8),   # purple
         ]
+        self.goal_color_names = ["green", "purple"]
         self.bg_color = torch.tensor([245, 245, 245], device=self.device, dtype=torch.uint8)  # near white
 
         self.agent_radius_px = 3
@@ -234,7 +238,65 @@ class PickAndPlaceEnv:
         """Return a freshly rendered frame without recording."""
         return self._render_frame()
 
-    def save_video(self, path: str, fps: int = 30):
+    def command_info(self) -> dict:
+        """Return a dict describing the current commanded colors (indices, names, RGB)."""
+        oi = int(self._target_object_idx)
+        gi = int(self._target_goal_idx)
+        return {
+            "object_index": oi,
+            "object_name": self.object_color_names[oi],
+            "object_rgb": self.object_colors[oi].tolist(),
+            "goal_index": gi,
+            "goal_name": self.goal_color_names[gi],
+            "goal_rgb": self.goal_colors[gi].tolist(),
+            "command": [float(self.command[0].item()), float(self.command[1].item())],
+        }
+
+    def _annotate_frames_with_command(self, frames: torch.Tensor) -> torch.Tensor:
+        """Overlay small color chips for commanded object/goal on each frame (in-place copy)."""
+        if frames.ndim != 4:
+            return frames
+        T, H, W, C = frames.shape
+        out = frames.clone()
+        # Chip geometry
+        pad = 2
+        size = 12
+        # object chip at top-left
+        o_y0, o_y1 = pad, min(H, pad + size)
+        o_x0, o_x1 = pad, min(W, pad + size)
+        # goal chip to the right of object chip
+        gap = 4
+        g_y0, g_y1 = pad, min(H, pad + size)
+        g_x0, g_x1 = min(W, o_x1 + gap), min(W, o_x1 + gap + size)
+
+        info = self.command_info()
+        o_col = torch.tensor(info["object_rgb"], dtype=torch.uint8).view(1, 1, 3)
+        g_col = torch.tensor(info["goal_rgb"], dtype=torch.uint8).view(1, 1, 3)
+
+        # Fill chips across all frames
+        out[:, o_y0:o_y1, o_x0:o_x1, :] = o_col
+        out[:, g_y0:g_y1, g_x0:g_x1, :] = g_col
+
+        # White border for visibility
+        border = 1
+        white = torch.tensor([255, 255, 255], dtype=torch.uint8)
+        if o_y1 - o_y0 > 2 and o_x1 - o_x0 > 2:
+            out[:, o_y0:o_y0+border, o_x0:o_x1, :] = white
+            out[:, o_y1-border:o_y1, o_x0:o_x1, :] = white
+            out[:, o_y0:o_y1, o_x0:o_x0+border, :] = white
+            out[:, o_y0:o_y1, o_x1-border:o_x1, :] = white
+        if g_y1 - g_y0 > 2 and g_x1 - g_x0 > 2:
+            out[:, g_y0:g_y0+border, g_x0:g_x1, :] = white
+            out[:, g_y1-border:g_y1, g_x0:g_x1, :] = white
+            out[:, g_y0:g_y1, g_x0:g_x0+border, :] = white
+            out[:, g_y0:g_y1, g_x1-border:g_x1, :] = white
+
+        return out
+
+    def save_video(
+        self,
+        path: str,
+    ):
         """Save recorded frames to an .mp4 video using torchvision.
 
         Requires `reset(record_video=True)` before stepping to collect frames.
@@ -243,12 +305,22 @@ class PickAndPlaceEnv:
             raise RuntimeError("No frames recorded. Call reset(record_video=True) and step().")
 
         # Stack to T x H x W x C uint8 and convert to tensor on CPU for write_video
-        frames = torch.stack(self._frames, dim=0).to("cpu")
+        frames = torch.stack(self._frames, dim=0).to(torch.uint8).to("cpu")
+        frames = self._annotate_frames_with_command(frames)
+
+        info = self.command_info()
+        target_path = path
         # write_video expects CxHxW or HxWxC? In torchvision>=0.14, it expects T x H x W x C uint8
-        write_video(filename=path, video_array=frames, fps=fps)
+        write_video(filename=target_path, video_array=frames, fps=30)
 
-
-# The module intentionally provides only the environment class with a minimal API.
+        sidecar = {
+            "video_path": target_path,
+            "fps": int(30),
+            "command": info,
+        }
+        sidecar_path = os.path.splitext(target_path)[0] + ".json"
+        with open(sidecar_path, "w", encoding="utf-8") as fh:
+            json.dump(sidecar, fh, indent=2)
 
 
 class ExpertController:

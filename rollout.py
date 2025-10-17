@@ -1,6 +1,8 @@
 import argparse
 import os
+import json
 import torch
+from torchvision.io import write_video
 from bc_model import BCModel
 from env import PickAndPlaceEnv
 
@@ -14,9 +16,10 @@ def rollout(model, episodes: int = 2, out_dir: str = ".", max_steps: int = 300, 
         device = next(model.parameters()).device
 
     os.makedirs(out_dir, exist_ok=True)
-    log_path = os.path.join(out_dir, f"log.txt")
 
     successes = 0
+    all_frames = []  # list of T_i x H x W x C uint8 tensors
+    episodes_meta = []
     env = PickAndPlaceEnv(seed=123)
     for ep in range(episodes):
         env.reset(record_video=render_video)
@@ -33,9 +36,10 @@ def rollout(model, episodes: int = 2, out_dir: str = ".", max_steps: int = 300, 
             frame = env.current_frame().to(torch.uint8)  # HxWx3 uint8 torch tensor
             img = frame.unsqueeze(0).permute(0, 3, 1, 2).float().div_(255.0).to(device)  # 1x3xHxW
             state = env.agent_pos.view(1, 2).to(device)
+            cmd = env.command.view(1, 2).to(device)
 
             # Predict next-position delta
-            dpos = model(img, state).squeeze(0).to("cpu")  # 2
+            dpos = model(img, state, cmd).squeeze(0).to("cpu")  # 2
             # PD control towards target position: pos + dpos
             pos_err = dpos  # target_pos - pos = (pos + dpos) - pos
             vel = env.agent_vel
@@ -48,17 +52,36 @@ def rollout(model, episodes: int = 2, out_dir: str = ".", max_steps: int = 300, 
                 successes += 1
                 break
 
-        # Optionally save video
         if render_video:
-            print(f"episode {ep}: success={env.success} steps={t+1}")
-            video_path = os.path.join(out_dir, f"bc_episode_{ep}.mp4")
-            env.save_video(video_path, fps=30)
-        with open(log_path, 'a') as f:
-            f.write(f"episode {ep}: success={env.success} steps={t+1}\n")
+            # Collect frames from this episode, annotate with chips, and queue for concatenation
+            frames = torch.stack(env._frames, dim=0).to(torch.uint8)
+            frames = env._annotate_frames_with_command(frames)
+            all_frames.append(frames)
+            # Episode metadata for sidecar
+            episodes_meta.append({
+                "episode": ep,
+                "success": bool(env.success),
+                "steps": int(t + 1),
+                "command": env.command_info(),
+            })
 
-    with open(log_path, 'a') as f:
-        f.write(f"successes: {successes}/{episodes}\n")
     print(f"successes: {successes}/{episodes}")
+    # Write a single concatenated video and one sidecar JSON
+    if render_video and all_frames:
+        video = torch.cat(all_frames, dim=0).to("cpu")  # T x H x W x C uint8
+        out_video = os.path.join(out_dir, "bc_rollout.mp4")
+        write_video(filename=out_video, video_array=video, fps=30)
+
+        sidecar = {
+            "video_path": out_video,
+            "fps": 30,
+            "episodes": episodes_meta,
+            "total_episodes": int(episodes),
+            "total_successes": int(successes),
+        }
+        sidecar_path = os.path.splitext(out_video)[0] + ".json"
+        with open(sidecar_path, "w", encoding="utf-8") as fh:
+            json.dump(sidecar, fh, indent=2)
     # Restore original mode
     if prev_training:
         model.train()

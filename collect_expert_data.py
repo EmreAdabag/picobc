@@ -15,11 +15,11 @@ def run_episode(max_steps: int = 500):
 
         # Save video for this episode
         path = f"episode_{ep}.mp4"
-        env.save_video(path, fps=30)
+        env.save_video(path)
         print(f"Episode {ep}: success={env.success}, steps={t+1}, video={path}")
 
 
 if __name__ == "__main__":
-    run_episode()
+    # run_episode()
     if 1:
-        collect_expert_dataset(2000, "expert_multitask.h5")
+        collect_expert_dataset(20000, "expert_multitask_20k.h5")
