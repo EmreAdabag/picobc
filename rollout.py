@@ -7,75 +7,64 @@ from bc_model import BCModel
 from env import PickAndPlaceEnv
 
 
+u_clip = 4.0
+kp, kd = 1000.0, 4.0
+
 @torch.no_grad()
-def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 10., render_video: bool = True, device=None):
-    # Preserve caller's mode and ensure restoration after eval
-    prev_training = model.training
-    model.eval()
-    if device is None:
-        device = next(model.parameters()).device
+def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 5., render_video: bool = True):
+    device = next(model.parameters()).device
 
     os.makedirs(out_dir, exist_ok=True)
 
-    successes = 0
-    all_frames = []  # list of T_i x H x W x C uint8 tensors
-    episodes_meta = []
-    env = PickAndPlaceEnv(seed=123)
-    max_steps = int(timeout_s / env.dt)
-    for ep in range(episodes):
-        env.reset(record_video=render_video)
-        # Align image/state timing with training (frames were captured post-step)
-        env.step(torch.zeros(2))
+    B = int(episodes)
+    env = PickAndPlaceEnv(seed=123, batch_size=B, dt=0.01)
+    max_steps = int(timeout_s / float(env.dt))
+    env.reset(record_video=render_video)
+    env.step(torch.zeros(B, 2))
 
-        # dt = float(env.dt.item())
-        u_clip = 5.0
-        # Simple PD gains (minimal, fixed)
-        kp, kd = 30.0, 8.0
+    done_step = torch.full((B,), -1, dtype=torch.long)
+    for t in range(max_steps):
+        frame = env.current_frame().to(torch.uint8)                 # [B,H,W,3]
+        img = frame.permute(0, 3, 1, 2).float().div_(255.0).to(device)  # [B,3,H,W]
+        state = env.agent_pos.to(device)                            # [B,2]
+        cmd = env.command.to(device)                                # [B,2]
 
-        for t in range(max_steps):
-            # Prepare image and state
-            frame = env.current_frame().to(torch.uint8)  # HxWx3 uint8 torch tensor
-            img = frame.unsqueeze(0).permute(0, 3, 1, 2).float().div_(255.0).to(device)  # 1x3xHxW
-            state = env.agent_pos.view(1, 2).to(device)
-            cmd = env.command.view(1, 2).to(device)
+        dpos_n = model(img, state, cmd).to("cpu")                   # [B,2] (normalized)
+        dpos = 0.5 * (dpos_n + 1.0) * (model.dpos_p98.to("cpu") - model.dpos_p02.to("cpu")) + model.dpos_p02.to("cpu")
+        u = kp * dpos - kd * env.agent_vel                          # [B,2]
+        u = torch.clamp(u, -u_clip, u_clip)
 
-            # Predict next-position delta
-            dpos = model(img, state, cmd).squeeze(0).to("cpu")  # 2
-            # PD control towards target position: pos + dpos
-            pos_err = dpos  # target_pos - pos = (pos + dpos) - pos
-            vel = env.agent_vel
-            # PD: spring towards target and damping on velocity
-            u = kp * pos_err - kd * vel
-            u = torch.clamp(u, -u_clip, u_clip)
+        out = env.step(u)
+        newly_done = (done_step < 0) & out["success"].to("cpu")
+        done_step[newly_done] = t
+        if bool(out["success"].all()):
+            break
 
-            out = env.step(u)
-            if out["success"]:
-                successes += 1
-                break
-
-        if render_video:
-            # Collect frames from this episode, annotate with chips, and queue for concatenation
-            frames = torch.stack(env._frames, dim=0).to(torch.uint8)
-            frames = env._annotate_frames_with_command(frames)
-            all_frames.append(frames)
-            # Episode metadata for sidecar
-            episodes_meta.append({
-                "episode": ep,
-                "success": bool(env.success),
-                "steps": int(t + 1),
-                "command": env.command_info(),
-            })
-
+    successes = int((done_step >= 0).sum().item())
     print(f"successes: {successes}/{episodes}")
-    # Write a single concatenated video and one sidecar JSON
-    if render_video and all_frames:
-        video = torch.cat(all_frames, dim=0).to("cpu")  # T x H x W x C uint8
+
+    if render_video and env._frames:
+        frames5 = torch.stack(env._frames, dim=0).to(torch.uint8)  # [T,B,H,W,3]
+        frames5 = env._annotate_frames_with_command(frames5)
+        T, Bv, H, W, C = frames5.shape
+        video = frames5.permute(1, 0, 2, 3, 4).reshape(T * Bv, H, W, C).to("cpu")
         out_video = os.path.join(out_dir, "bc_rollout.mp4")
-        write_video(filename=out_video, video_array=video, fps=30)
+        fps = int(1.0 / float(env.dt))
+        write_video(filename=out_video, video_array=video, fps=fps)
+
+        episodes_meta = []
+        for b in range(B):
+            steps_b = int(done_step[b].item()) + 1 if int(done_step[b].item()) >= 0 else int(t)
+            episodes_meta.append({
+                "episode": int(b),
+                "success": bool(done_step[b].item() >= 0),
+                "steps": steps_b,
+                "command": env.command_info(b),
+            })
 
         sidecar = {
             "video_path": out_video,
-            "fps": 30,
+            "fps": fps,
             "episodes": episodes_meta,
             "total_episodes": int(episodes),
             "total_successes": int(successes),
@@ -83,11 +72,37 @@ def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 10.
         sidecar_path = os.path.splitext(out_video)[0] + ".json"
         with open(sidecar_path, "w", encoding="utf-8") as fh:
             json.dump(sidecar, fh, indent=2)
-    # Restore original mode
-    if prev_training:
-        model.train()
-    else:
-        model.eval()
+
+    return successes
+
+@torch.no_grad()
+def rollout_batch(model, episodes: int = 100, timeout_s: float = 10.):
+    device = next(model.parameters()).device
+
+    B = int(episodes)
+    env = PickAndPlaceEnv(seed=123, batch_size=B)
+    max_steps = int(timeout_s / float(env.dt))
+    env.reset()
+    env.step(torch.zeros(B, 2))
+
+
+    for _ in range(max_steps):
+        frame = env.current_frame().to(torch.uint8)  # [B,H,W,3]
+        img = frame.permute(0, 3, 1, 2).float().div_(255.0).to(device)  # [B,3,H,W]
+        state = env.agent_pos.to(device)  # [B,2]
+        cmd = env.command.to(device)      # [B,2]
+
+        dpos_n = model(img, state, cmd).to("cpu")  # [B,2] (normalized)
+        dpos = 0.5 * (dpos_n + 1.0) * (model.dpos_p98.to("cpu") - model.dpos_p02.to("cpu")) + model.dpos_p02.to("cpu")
+        u = kp * dpos - kd * env.agent_vel       # [B,2]
+        u = torch.clamp(u, -u_clip, u_clip)
+
+        out = env.step(u)
+        if bool(out["success"].all()):
+            break
+
+    successes = int(env.success.sum().item())
+    print(f"successes: {successes}/{episodes}")
     return successes
 
 
@@ -105,4 +120,4 @@ if __name__ == "__main__":
     state_dict = torch.load(args.ckpt, map_location=device)
     model.load_state_dict(state_dict)
 
-    rollout(model, episodes=args.episodes, out_dir=args.out_dir, render_video=(not args.no_video), device=device)
+    rollout(model, episodes=args.episodes, out_dir=args.out_dir, render_video=(not args.no_video), timeout_s=5.)

@@ -28,9 +28,16 @@ class BCModel(nn.Module):
             nn.Linear(self.hidden_dim, 2),
         )
 
+        # normalization buffers (per-dim percentiles)
+        self.register_buffer('state_p02', torch.zeros(2))
+        self.register_buffer('state_p98', torch.ones(2))
+        self.register_buffer('dpos_p02', torch.zeros(2))
+        self.register_buffer('dpos_p98', torch.ones(2))
+
     def forward(self, img: torch.Tensor, state: torch.Tensor, command: torch.Tensor) -> torch.Tensor:
         # img: Bx3xHxW in [0,1]; state: Bx2 (pos); command: Bx2 ([obj_color, goal_color])
         z = self.backbone(img)
-        x = torch.cat([z, state, command], dim=-1)
-        dpos = self.head(x)
-        return dpos
+        s = (2.0 * (state - self.state_p02) / (self.state_p98 - self.state_p02) - 1.0).clamp(-1.5, 1.5)
+        x = torch.cat([z, s, command], dim=-1)
+        dpos_norm = self.head(x)
+        return dpos_norm

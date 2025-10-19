@@ -8,10 +8,13 @@ import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 from bc_model import BCModel
-from rollout import rollout as eval_rollout
+from rollout import rollout_batch as eval_rollout
 import wandb
 
-USE_WANDB=0
+USE_WANDB=1
+def wandb_log_maybe(log, step=None):
+    if USE_WANDB:
+        wandb.log(log, step=step)    
 
 
 class HDF5DeltaDataset(Dataset):
@@ -79,31 +82,29 @@ class HDF5DeltaDataset(Dataset):
 
 @torch.no_grad()
 def _eval_closed_loop_using_rollout(model: BCModel, episodes: int = 10, timeout_s: float = 5.0) -> tuple[int, int]:
-    # Directly evaluate the in-memory model without saving, no videos
-    successes = eval_rollout(model, episodes=episodes, timeout_s=timeout_s, render_video=False)
-    # Ensure training mode after eval
+    model.eval()
+    successes = eval_rollout(model, episodes=episodes, timeout_s=timeout_s)
     model.train()
-    return successes, int(episodes)
+    return successes, episodes
 
 
-def train(dataset_path: str, out_path: str, steps: int, batch_size: int, lr: float, resume: str | None, backbone_ckpt: str | None, num_demos: int):
+def train(dataset_path: str, out_dir: str, steps: int, batch_size: int, lr: float, resume: str | None, pretrained_backbone: str | None, num_demos: int):
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    eval_every_n_steps = 1000
 
     if USE_WANDB:
         wandb.init(project=os.environ.get('WANDB_PROJECT', 'mcdonalds'), config={
             'data': dataset_path,
-            'out': out_path,
+            'out': out_dir,
             'steps': steps,
             'batch_size': batch_size,
             'lr': lr,
             'resume': resume,
-            'backbone_ckpt': backbone_ckpt,
+            'pretrained_backbone': pretrained_backbone,
             'num_demos': num_demos,
             'device': str(device),
         })
 
-    # Ensure output directory exists (treat out_path as directory)
-    out_dir = out_path
     os.makedirs(out_dir, exist_ok=True)
 
     ds = HDF5DeltaDataset(dataset_path, num_demos=num_demos)
@@ -119,21 +120,20 @@ def train(dataset_path: str, out_path: str, steps: int, batch_size: int, lr: flo
     val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, 
                         pin_memory=torch.cuda.is_available())
 
-    print(f"dataset size: {N} | train: {train_size} | val: {val_size} | batch size: {batch_size}")
-    if USE_WANDB:
-        wandb.config.update({'dataset_size': N, 'train_size': train_size, 'val_size': val_size}, allow_val_change=True)
-
     model = BCModel().to(device)
     n_params = sum(p.numel() for p in model.parameters())
+
+    print(f"dataset size: {N} | train: {train_size} | val: {val_size} | batch size: {batch_size}")
     print(f"trainable params: {n_params}")
     if USE_WANDB:
+        wandb.config.update({'dataset_size': N, 'train_size': train_size, 'val_size': val_size}, allow_val_change=True)
         wandb.config.update({'trainable_params': int(n_params)}, allow_val_change=True)
     
-    if backbone_ckpt:
-        b_state = torch.load(backbone_ckpt, map_location=device)
+    if pretrained_backbone:
+        b_state = torch.load(pretrained_backbone, map_locatio=device)
         filtered = {k[len('backbone.'):]: v for k, v in b_state.items() if k.startswith('backbone.')}
         model.backbone.load_state_dict(filtered, strict=True)
-        print(f"initialized backbone from {backbone_ckpt}")
+        print(f"initialized backbone from {pretrained_backbone}")
 
     if resume:
         state = torch.load(resume, map_location=device)
@@ -142,6 +142,18 @@ def train(dataset_path: str, out_path: str, steps: int, batch_size: int, lr: flo
     
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
+
+    # compute normalization stats on training split (per-dim percentiles)
+    tr_idx = train_ds.indices
+    state_arr = np.stack([ds.data[i][1] for i in tr_idx], axis=0)
+    dpos_arr = np.stack([ds.data[i][2] - ds.data[i][1] for i in tr_idx], axis=0)
+    s_p02, s_p98 = np.percentile(state_arr, [2, 98], axis=0)
+    d_p02, d_p98 = np.percentile(dpos_arr, [2, 98], axis=0)
+    model.state_p02.copy_(torch.tensor(s_p02, dtype=torch.float32, device=device))
+    model.state_p98.copy_(torch.tensor(s_p98, dtype=torch.float32, device=device))
+    model.dpos_p02.copy_(torch.tensor(d_p02, dtype=torch.float32, device=device))
+    model.dpos_p98.copy_(torch.tensor(d_p98, dtype=torch.float32, device=device))
+    print(f"norm: state p02={s_p02.tolist()} p98={s_p98.tolist()} dpos p02={d_p02.tolist()} p98={d_p98.tolist()}")
 
     model.train()
     best_val = float('inf')
@@ -160,7 +172,8 @@ def train(dataset_path: str, out_path: str, steps: int, batch_size: int, lr: flo
 
             opt.zero_grad(set_to_none=True)
             pred = model(img, state, cmd)
-            loss = loss_fn(pred, dpos)
+            dpos_n = (2.0 * (dpos - model.dpos_p02) / (model.dpos_p98 - model.dpos_p02) - 1.0).clamp(-1.5, 1.5)
+            loss = loss_fn(pred, dpos_n)
             loss.backward()
             opt.step()
 
@@ -169,11 +182,11 @@ def train(dataset_path: str, out_path: str, steps: int, batch_size: int, lr: flo
 
             global_step += 1
             if global_step % 5 == 0:
-                if USE_WANDB:
-                    wandb.log({'train/loss': loss.item(), 'epoch': global_ep}, step=global_step)
+                wandb_log_maybe({'train/loss': loss.item(), 'epoch': global_ep}, step=global_step)
 
         train_loss = total/max(1,count)
         print(f"epoch {global_ep}/{epochs} | loss={train_loss:.6f}")
+        
         # Validation
         if len(val_dl) > 0:
             model.eval()
@@ -185,25 +198,26 @@ def train(dataset_path: str, out_path: str, steps: int, batch_size: int, lr: flo
                     cmd = cmd.to(device)
                     dpos = dpos.to(device)
                     pred = model(img, state, cmd)
-                    v_total += nn.functional.mse_loss(pred, dpos, reduction='sum').item()
+                    dpos_n = (2.0 * (dpos - model.dpos_p02) / (model.dpos_p98 - model.dpos_p02) - 1.0).clamp(-1.5, 1.5)
+                    v_total += nn.functional.mse_loss(pred, dpos_n, reduction='sum').item()
                     v_count += img.size(0)
                 val_loss = v_total / max(1, v_count)
             print(f"val_loss={val_loss:.6f}")
-            if USE_WANDB:
-                wandb.log({'val/loss': val_loss, 'epoch': global_ep}, step=global_step)
+            wandb_log_maybe({'val/loss': val_loss, 'epoch': global_ep}, step=global_step)
             if val_loss < best_val:
                 best_val = val_loss
                 best_path = os.path.join(out_dir, "best.pt")
                 torch.save(model.state_dict(), best_path)
         model.train()
-        if (global_step) // 1000 != (global_step - steps_per_epoch) // 1000:
+        
+        # sim eval
+        if (global_step) // eval_every_n_steps != (global_step - steps_per_epoch) // eval_every_n_steps:
             ckpt_path = os.path.join(out_dir, f"checkpoint_ep{global_ep}.pt")
             torch.save(model.state_dict(), ckpt_path)
             s, tot = _eval_closed_loop_using_rollout(model, episodes=100, timeout_s=5.0)
             rate = s / max(1, tot)
             print(f"closed-loop eval @epoch {global_ep}: success {s}/{tot} (rate={rate:.2f})")
-            if USE_WANDB:
-                wandb.log({'eval/success_rate': rate, 'epoch': global_ep}, step=global_step)
+            wandb_log_maybe({'eval/success_rate': rate, 'epoch': global_ep}, step=global_step)
 
     final_path = os.path.join(out_dir, "final.pt")
     torch.save(model.state_dict(), final_path)
@@ -220,8 +234,8 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--resume', type=str, default=None, help='Path to model checkpoint to initialize from')
-    parser.add_argument('--backbone_ckpt', type=str, default=None, help='Checkpoint for backbone')
+    parser.add_argument('--pretrained_backbone', type=str, default=None, help='Checkpoint for backbone')
     parser.add_argument('--num_demos', type=int, default=0, help='Number of demonstrations to use before split (0 = all)')
     args = parser.parse_args()
 
-    train(args.data, args.out, steps=args.steps, batch_size=args.batch_size, lr=args.lr, resume=args.resume, backbone_ckpt=args.backbone_ckpt, num_demos=args.num_demos)
+    train(args.data, args.out, steps=args.steps, batch_size=args.batch_size, lr=args.lr, resume=args.resume, pretrained_backbone=args.pretrained_backbone, num_demos=args.num_demos)
