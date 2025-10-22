@@ -1,9 +1,12 @@
+from operator import mul
 import os
 import json
+import numpy as np
 import torch
 from tqdm import tqdm
 from torchvision.io import write_video
 import h5py
+import zarr
 
 class PickAndPlaceEnv:
     """
@@ -117,7 +120,7 @@ class PickAndPlaceEnv:
                     goal_idx[bad] = torch.randint(0, 2, (int(bad.sum().item()),), generator=self.rng)
                     bad = (obj_idx == excl_o) & (goal_idx == excl_g)
         else:
-            obj_idx = goal_idx = 0
+            obj_idx = goal_idx = torch.zeros((B,))
         self._target_object_idx = obj_idx.to(torch.long)
         self._target_goal_idx = goal_idx.to(torch.long)
         self.command = torch.stack([self._target_object_idx.to(self.dtype), self._target_goal_idx.to(self.dtype)], dim=-1).to(self.device)
@@ -306,116 +309,3 @@ class PickAndPlaceEnv:
         sidecar_path = os.path.splitext(target_path)[0] + ".json"
         with open(sidecar_path, "w", encoding="utf-8") as fh:
             json.dump(sidecar, fh, indent=2)
-
-
-class ExpertController:
-    """
-    Batched PD controller using full state knowledge.
-    Phases per batch item: to object until picked, then to goal until delivered.
-    """
-
-    def __init__(self):
-        self.kp = 20.0
-        self.kd = 4.0
-        self.kp_loaded = 10.0
-        self.kd_loaded = 8.0
-        self.u_clip = 4.0
-
-    def act(self, env: PickAndPlaceEnv) -> torch.Tensor:
-        B = env.B
-        target = torch.where((~env.picked).unsqueeze(-1), env.object_pos, env.goal_center)  # [B,2]
-        kp = torch.where(env.picked, self.kp_loaded, self.kp).unsqueeze(1)
-        kd = torch.where(env.picked, self.kd_loaded, self.kd).unsqueeze(1)
-        pos = env.agent_pos
-        vel = env.agent_vel
-        u = kp * (target - pos) - kd * vel
-        
-        # done = env.delivered
-        # u[done] = torch.zeros(2, device=env.device, dtype=env.dtype)
-        u = torch.clamp(u, min=-self.u_clip, max=self.u_clip)
-        return u
-
-
-def collect_expert_dataset(N: int, path: str):
-    """
-    Collect N expert demonstrations with a batched env (B=100) and save to HDF5.
-
-    Assumes N is a multiple of 100. Writes one episode per batch item.
-    """
-
-    B = 20
-    if int(N) % B != 0:
-        raise ValueError(f"N must be a multiple of {B} for batched collection")
-    env = PickAndPlaceEnv(batch_size=B)
-    ctrl = ExpertController()
-
-    total_samples = 0
-    max_steps = int(10.0 / float(env.dt)) # 10s
-    
-    H, W = int(env.H), int(env.W)
-    frames_all = torch.empty(max_steps, B, H, W, 3, dtype=torch.uint8)
-    poss_all = torch.empty(max_steps, B, 2, dtype=torch.float32)
-    vels_all = torch.empty(max_steps, B, 2, dtype=torch.float32)
-    ctrls_all = torch.empty(max_steps, B, 2, dtype=torch.float32)
-    obj_all = torch.empty(max_steps, B, 2, dtype=torch.float32)
-    goal_all = torch.empty(max_steps, B, 2, dtype=torch.float32)
-
-    with h5py.File(path, "w") as f:
-        for start in tqdm(range(0, int(N), B)):
-            env.reset(record_video=False)
-
-            # Preallocate CPU buffers for the trajectory (faster than list appends)
-
-            active = torch.ones(B, dtype=torch.bool)
-            done_step = torch.full((B,), -1, dtype=torch.long)
-            t = 0
-            while bool(active.any()) and t < max_steps:
-                u = ctrl.act(env)  # [B,2]
-                out = env.step(u)
-
-                # Snapshot tensors for this step as batched CPU tensors
-                frames_all[t] = env.current_frame().to("cpu")
-                poss_all[t] = env.agent_pos.to("cpu")
-                vels_all[t] = env.agent_vel.to("cpu")
-                ctrls_all[t] = u.to("cpu")
-                obj_all[t] = env.object_pos.to("cpu")
-                goal_all[t] = env.goal_center.to("cpu")
-
-                succ_cpu = out["success"].to("cpu")
-                newly_done = active & succ_cpu
-                done_step[newly_done] = t
-                active[newly_done] = False
-                t += 1
-
-            # Emit each batch item as an episode
-            for b in range(B):
-                ep_idx = start + b
-                t_end = int(done_step[b].item()) + 1 if int(done_step[b].item()) >= 0 else t
-                g = f.create_group(f"ep_{ep_idx}")
-                g.create_dataset("images", data=frames_all[:t_end, b].numpy(), compression="gzip")
-                g.create_dataset("agent_pos", data=poss_all[:t_end, b].numpy())
-                g.create_dataset("agent_vel", data=vels_all[:t_end, b].numpy())
-                g.create_dataset("agent_ctrl", data=ctrls_all[:t_end, b].numpy())
-                g.create_dataset("object_pos", data=obj_all[:t_end, b].numpy())
-                g.create_dataset("goal_center", data=goal_all[:t_end, b].numpy())
-                g.create_dataset("command", data=env.command[b].to(torch.float32).cpu().numpy())
-
-                total_samples += t_end
-        
-        demo_hours = float(total_samples) * float(env.dt) / 3600.0
-        samples_per_demo = total_samples / N
-
-        meta = f.create_group("meta")
-        meta.attrs["demo_hours"] = float(demo_hours)
-        meta.attrs["samples_per_demo"] = float(samples_per_demo)
-        meta.attrs["total_samples"] = int(total_samples)
-        meta.attrs["dt"] = float(env.dt)
-        meta.attrs["N"] = int(N)
-        meta.attrs["multi_task"] = bool(env.multi_task)
-        meta.create_dataset("object_color_names", data=[n.encode("utf-8") for n in env.object_color_names])
-        meta.create_dataset("goal_color_names", data=[n.encode("utf-8") for n in env.goal_color_names])
-        meta.create_dataset("object_colors_rgb", data=torch.stack(env.object_colors).cpu().numpy())
-        meta.create_dataset("goal_colors_rgb", data=torch.stack(env.goal_colors).cpu().numpy())
-        meta.create_dataset("agent_color_rgb", data=env.agent_color.cpu().numpy())
-
-        print(f"wrote {demo_hours} hours of data from {N} demonstrations totalling {total_samples} datapoints, avg: {samples_per_demo} samples per demo")

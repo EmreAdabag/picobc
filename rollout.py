@@ -3,12 +3,11 @@ import os
 import json
 import torch
 from torchvision.io import write_video
-from bc_model import BCModel
+from bc_model import BCModel, normalize, unnormalize
 from env import PickAndPlaceEnv
 
-
 u_clip = 4.0
-kp, kd = 1000.0, 4.0
+kp, kd = 1500.0, 4.0
 
 @torch.no_grad()
 def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 5., render_video: bool = True):
@@ -29,8 +28,9 @@ def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 5.,
         state = env.agent_pos.to(device)                            # [B,2]
         cmd = env.command.to(device)                                # [B,2]
 
-        dpos_n = model(img, state, cmd).to("cpu")                   # [B,2] (normalized)
-        dpos = 0.5 * (dpos_n + 1.0) * (model.dpos_p98.to("cpu") - model.dpos_p02.to("cpu")) + model.dpos_p02.to("cpu")
+        state_norm = normalize(state, model.state_min, model.state_max)
+        dpos_n = model(img, state_norm, cmd)                        # [B,2] (normalized)
+        dpos = unnormalize(dpos_n, model.dpos_min, model.dpos_max).to("cpu")
         u = kp * dpos - kd * env.agent_vel                          # [B,2]
         u = torch.clamp(u, -u_clip, u_clip)
 
@@ -76,7 +76,7 @@ def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 5.,
     return successes
 
 @torch.no_grad()
-def rollout_batch(model, episodes: int = 100, timeout_s: float = 10.):
+def batch_eval(model, episodes: int = 100, timeout_s: float = 10.):
     device = next(model.parameters()).device
 
     B = int(episodes)
@@ -85,15 +85,15 @@ def rollout_batch(model, episodes: int = 100, timeout_s: float = 10.):
     env.reset()
     env.step(torch.zeros(B, 2))
 
-
     for _ in range(max_steps):
         frame = env.current_frame().to(torch.uint8)  # [B,H,W,3]
         img = frame.permute(0, 3, 1, 2).float().div_(255.0).to(device)  # [B,3,H,W]
         state = env.agent_pos.to(device)  # [B,2]
         cmd = env.command.to(device)      # [B,2]
 
-        dpos_n = model(img, state, cmd).to("cpu")  # [B,2] (normalized)
-        dpos = 0.5 * (dpos_n + 1.0) * (model.dpos_p98.to("cpu") - model.dpos_p02.to("cpu")) + model.dpos_p02.to("cpu")
+        state_norm = normalize(state, model.state_min, model.state_max)
+        dpos_n = model(img, state_norm, cmd)
+        dpos = unnormalize(dpos_n, model.dpos_min, model.dpos_max).to("cpu")
         u = kp * dpos - kd * env.agent_vel       # [B,2]
         u = torch.clamp(u, -u_clip, u_clip)
 

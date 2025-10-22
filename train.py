@@ -1,96 +1,92 @@
 import os
 import math
 import argparse
-import h5py
+import zarr
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
-from bc_model import BCModel
-from rollout import rollout_batch as eval_rollout
+from bc_model import BCModel, normalize, unnormalize
+from rollout import batch_eval as eval_rollout
+from visualize.vector_field import visualize_vector_field
 import wandb
 
+
 USE_WANDB=1
+
+def save_checkpoint(model, optimizer, epoch, step, out_dir, filename):
+    path = os.path.join(out_dir, filename)
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'epoch': epoch,
+        'step': step,
+    }, path)
 def wandb_log_maybe(log, step=None):
     if USE_WANDB:
         wandb.log(log, step=step)    
 
 
-class HDF5DeltaDataset(Dataset):
-    """Loads all transitions from HDF5 into RAM for fast access.
-
-    Preloads all data as numpy arrays (uint8 for images to save memory).
-    Converts to tensors on-the-fly in __getitem__.
-    """
+class ZarrDeltaDataset(Dataset):
     def __init__(self, path: str, num_demos: int = 0):
         super().__init__()
-        self.data = []  # List of (img_uint8, pos_t, pos_tp1, cmd) tuples
-
-        groups = None
-        if num_demos > 0:
-            with h5py.File(path, 'r') as f:
-                all_groups = list(f.keys())
-            assert num_demos <= len(all_groups)
-            rng = np.random.default_rng()
-            rng.shuffle(all_groups)
-            groups = all_groups[:num_demos]
-
-        # Load all data into memory
-        print(f"Loading HDF5 file into memory: {path}")
-        with h5py.File(path, 'r') as f:
-            keys = list(f.keys()) if groups is None else list(groups)
-            for k in tqdm(keys, desc="Loading episodes"):
-                g = f[k]
-                if 'images' not in g or 'agent_pos' not in g or 'command' not in g:
-                    continue
-                
-                # Load entire episode at once
-                images = np.array(g['images'])       # TxHxWx3 uint8
-                agent_pos = np.array(g['agent_pos']) # Tx2 float
-                command = np.array(g['command'])     # 2 float
-                
-                T = images.shape[0]
-                if T < 2:
-                    continue
-                
-                # Store all transitions
-                for t in range(T - 1):
-                    self.data.append((
-                        images[t],        # HxWx3 uint8
-                        agent_pos[t],     # 2
-                        agent_pos[t + 1], # 2
-                        command           # 2
-                    ))
+        root = zarr.open_group(path, mode='r')
         
-        print(f"Loaded {len(self.data)} transitions into memory")
+        imgs = root['data']['img'][:]
+        states = root['data']['state'][:]
+        cmds = root['data']['cmd'][:]
+        episode_ends = root['meta']['episode_ends'][:]
+        
+        if num_demos > 0:
+            assert num_demos <= len(episode_ends)
+            episode_ends = episode_ends[:num_demos]
+            end_idx = episode_ends[-1]
+            imgs = imgs[:end_idx]
+            states = states[:end_idx]
+            cmds = cmds[:end_idx]
+        
+        indices = []
+        for i in range(len(episode_ends)):
+            start_idx = 0 if i == 0 else episode_ends[i-1]
+            end_idx = episode_ends[i]
+            for t in range(start_idx, end_idx - 1):
+                indices.append(t)
+        
+        self.imgs = imgs
+        self.cmds = cmds
+        self.indices = indices
+        
+        state_arr = states[indices]
+        dpos_arr = states[[i+1 for i in indices]] - state_arr
+        
+        self.state_min = state_arr.min(axis=0)
+        self.state_max = state_arr.max(axis=0)
+        self.dpos_min = dpos_arr.min(axis=0)
+        self.dpos_max = dpos_arr.max(axis=0)
+        
+        self.states_norm = normalize(states, self.state_min, self.state_max)
+        dpos_all = np.zeros_like(states)
+        dpos_all[:-1] = states[1:] - states[:-1]
+        self.dpos_norm = normalize(dpos_all, self.dpos_min, self.dpos_max)
+        
+        print(f"Loaded {len(indices)} transitions")
 
     def __len__(self):
-        return len(self.data)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        img, pos_t, pos_tp1, cmd = self.data[idx]
-        
-        # Convert from numpy to tensor
-        img_t = torch.from_numpy(img).permute(2, 0, 1).float().div_(255.0).contiguous()   # 3xHxW
-        state_t = torch.from_numpy(pos_t).float().contiguous()                              # 2
-        cmd_t = torch.from_numpy(cmd).float().contiguous()                                  # 2
-        dpos = torch.from_numpy(pos_tp1 - pos_t).float().contiguous()                       # 2
-
-        return img_t, state_t, cmd_t, dpos
+        t = self.indices[idx]
+        img = torch.from_numpy(self.imgs[t]).permute(2, 0, 1).float().div_(255.0)
+        state_t_norm = torch.from_numpy(self.states_norm[t]).float()
+        cmd_t = torch.from_numpy(self.cmds[t]).float()
+        dpos_norm = torch.from_numpy(self.dpos_norm[t]).float()
+        return img, state_t_norm, cmd_t, dpos_norm
 
 
-@torch.no_grad()
-def _eval_closed_loop_using_rollout(model: BCModel, episodes: int = 10, timeout_s: float = 5.0) -> tuple[int, int]:
-    model.eval()
-    successes = eval_rollout(model, episodes=episodes, timeout_s=timeout_s)
-    model.train()
-    return successes, episodes
 
-
-def train(dataset_path: str, out_dir: str, steps: int, batch_size: int, lr: float, resume: str | None, pretrained_backbone: str | None, num_demos: int):
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    eval_every_n_steps = 1000
+def train(dataset_path: str, out_dir: str, steps: int, batch_size: int, lr: float, resume: str | None, pretrained_backbone: str | None, num_demos: int, device: str):
+    eval_every_n_steps = 20000
 
     if USE_WANDB:
         wandb.init(project=os.environ.get('WANDB_PROJECT', 'mcdonalds'), config={
@@ -107,22 +103,25 @@ def train(dataset_path: str, out_dir: str, steps: int, batch_size: int, lr: floa
 
     os.makedirs(out_dir, exist_ok=True)
 
-    ds = HDF5DeltaDataset(dataset_path, num_demos=num_demos)
+    ds = ZarrDeltaDataset(dataset_path, num_demos=num_demos)
     N = len(ds)
     val_size = max(1, int(round(0.1 * N))) if N > 0 else 0
     train_size = max(0, N - val_size)
     train_ds, val_ds = random_split(ds, [train_size, val_size])
 
-    # Data is in memory, use fewer workers to avoid serialization overhead
     num_workers = 4
-    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, 
-                          pin_memory=torch.cuda.is_available())
-    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, 
-                        pin_memory=torch.cuda.is_available())
+    train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=torch.cuda.is_available())
+    val_dl = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=torch.cuda.is_available())
 
     model = BCModel().to(device)
-    n_params = sum(p.numel() for p in model.parameters())
+    
+    model.state_min.copy_(torch.from_numpy(ds.state_min).float().to(model.state_min.device))
+    model.state_max.copy_(torch.from_numpy(ds.state_max).float().to(model.state_max.device))
+    model.dpos_min.copy_(torch.from_numpy(ds.dpos_min).float().to(model.dpos_min.device))
+    model.dpos_max.copy_(torch.from_numpy(ds.dpos_max).float().to(model.dpos_max.device))
+    
 
+    n_params = sum(p.numel() for p in model.parameters())
     print(f"dataset size: {N} | train: {train_size} | val: {val_size} | batch size: {batch_size}")
     print(f"trainable params: {n_params}")
     if USE_WANDB:
@@ -130,37 +129,29 @@ def train(dataset_path: str, out_dir: str, steps: int, batch_size: int, lr: floa
         wandb.config.update({'trainable_params': int(n_params)}, allow_val_change=True)
     
     if pretrained_backbone:
-        b_state = torch.load(pretrained_backbone, map_locatio=device)
+        b_state = torch.load(pretrained_backbone, map_location=device)
         filtered = {k[len('backbone.'):]: v for k, v in b_state.items() if k.startswith('backbone.')}
         model.backbone.load_state_dict(filtered, strict=True)
         print(f"initialized backbone from {pretrained_backbone}")
-
-    if resume:
-        state = torch.load(resume, map_location=device)
-        model.load_state_dict(state)
-        print(f"loaded checkpoint from {resume}")
     
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
-
-    # compute normalization stats on training split (per-dim percentiles)
-    tr_idx = train_ds.indices
-    state_arr = np.stack([ds.data[i][1] for i in tr_idx], axis=0)
-    dpos_arr = np.stack([ds.data[i][2] - ds.data[i][1] for i in tr_idx], axis=0)
-    s_p02, s_p98 = np.percentile(state_arr, [2, 98], axis=0)
-    d_p02, d_p98 = np.percentile(dpos_arr, [2, 98], axis=0)
-    model.state_p02.copy_(torch.tensor(s_p02, dtype=torch.float32, device=device))
-    model.state_p98.copy_(torch.tensor(s_p98, dtype=torch.float32, device=device))
-    model.dpos_p02.copy_(torch.tensor(d_p02, dtype=torch.float32, device=device))
-    model.dpos_p98.copy_(torch.tensor(d_p98, dtype=torch.float32, device=device))
-    print(f"norm: state p02={s_p02.tolist()} p98={s_p98.tolist()} dpos p02={d_p02.tolist()} p98={d_p98.tolist()}")
+    
+    start_epoch = 0
+    global_step = 0
+    if resume:
+        checkpoint = torch.load(resume, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        opt.load_state_dict(checkpoint['optimizer_state_dict'])
+        start_epoch = checkpoint.get('epoch', 0)
+        global_step = checkpoint.get('step', 0)
+        print(f"loaded checkpoint from {resume} (epoch={start_epoch}, step={global_step})")
 
     model.train()
     best_val = float('inf')
-    global_step = 0
     steps_per_epoch = math.ceil(train_size / batch_size)
     epochs = int(batch_size * steps // train_size)
-    for ep in range(epochs):
+    for ep in range(start_epoch, epochs):
         global_ep = ep + 1
         total = 0.0
         count = 0
@@ -172,8 +163,7 @@ def train(dataset_path: str, out_dir: str, steps: int, batch_size: int, lr: floa
 
             opt.zero_grad(set_to_none=True)
             pred = model(img, state, cmd)
-            dpos_n = (2.0 * (dpos - model.dpos_p02) / (model.dpos_p98 - model.dpos_p02) - 1.0).clamp(-1.5, 1.5)
-            loss = loss_fn(pred, dpos_n)
+            loss = loss_fn(pred, dpos)
             loss.backward()
             opt.step()
 
@@ -198,30 +188,32 @@ def train(dataset_path: str, out_dir: str, steps: int, batch_size: int, lr: floa
                     cmd = cmd.to(device)
                     dpos = dpos.to(device)
                     pred = model(img, state, cmd)
-                    dpos_n = (2.0 * (dpos - model.dpos_p02) / (model.dpos_p98 - model.dpos_p02) - 1.0).clamp(-1.5, 1.5)
-                    v_total += nn.functional.mse_loss(pred, dpos_n, reduction='sum').item()
+                    v_total += nn.functional.mse_loss(pred, dpos, reduction='sum').item()
                     v_count += img.size(0)
                 val_loss = v_total / max(1, v_count)
             print(f"val_loss={val_loss:.6f}")
             wandb_log_maybe({'val/loss': val_loss, 'epoch': global_ep}, step=global_step)
             if val_loss < best_val:
                 best_val = val_loss
-                best_path = os.path.join(out_dir, "best.pt")
-                torch.save(model.state_dict(), best_path)
-        model.train()
+                save_checkpoint(model, opt, global_ep, global_step, out_dir, "best.pt")
+            model.train()
         
         # sim eval
         if (global_step) // eval_every_n_steps != (global_step - steps_per_epoch) // eval_every_n_steps:
-            ckpt_path = os.path.join(out_dir, f"checkpoint_ep{global_ep}.pt")
-            torch.save(model.state_dict(), ckpt_path)
-            s, tot = _eval_closed_loop_using_rollout(model, episodes=100, timeout_s=5.0)
-            rate = s / max(1, tot)
-            print(f"closed-loop eval @epoch {global_ep}: success {s}/{tot} (rate={rate:.2f})")
+            save_checkpoint(model, opt, global_ep, global_step, out_dir, f"checkpoint_ep{global_ep}.pt")
+            
+            model.eval()
+            eps = 100
+            successes = eval_rollout(model, episodes=eps, timeout_s=5.)
+            rate = successes / max(1, eps)
+            print(f"closed-loop eval @epoch {global_ep}: success {successes}/{eps} (rate={rate:.2f})")
             wandb_log_maybe({'eval/success_rate': rate, 'epoch': global_ep}, step=global_step)
+            
+            vector_field_path = os.path.join(out_dir, f"vector_field_ep{global_ep}.png")
+            visualize_vector_field(model, vector_field_path)
+            model.train()
 
-    final_path = os.path.join(out_dir, "final.pt")
-    torch.save(model.state_dict(), final_path)
-    print(f"saved final checkpoint to {final_path}")
+    save_checkpoint(model, opt, global_ep, global_step, out_dir, "final.pt")
     if USE_WANDB:
         wandb.finish()
 
@@ -230,12 +222,13 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, required=True, help='Path to HDF5 dataset')
     parser.add_argument('--out', type=str, default='ckpts', help='Output directory for checkpoints')
-    parser.add_argument('--steps', type=int, default=10000)
+    parser.add_argument('--steps', type=int, default=1000000)
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--resume', type=str, default=None, help='Path to model checkpoint to initialize from')
     parser.add_argument('--pretrained_backbone', type=str, default=None, help='Checkpoint for backbone')
     parser.add_argument('--num_demos', type=int, default=0, help='Number of demonstrations to use before split (0 = all)')
+    parser.add_argument('--device', type=str, default='cuda', help='Device (e.g. cuda:0)')
     args = parser.parse_args()
 
-    train(args.data, args.out, steps=args.steps, batch_size=args.batch_size, lr=args.lr, resume=args.resume, pretrained_backbone=args.pretrained_backbone, num_demos=args.num_demos)
+    train(args.data, args.out, steps=args.steps, batch_size=args.batch_size, lr=args.lr, resume=args.resume, pretrained_backbone=args.pretrained_backbone, num_demos=args.num_demos, device=torch.device(args.device))
