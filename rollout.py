@@ -3,33 +3,41 @@ import os
 import json
 import torch
 from torchvision.io import write_video
-from bc_model import BCModel, normalize, unnormalize
+from bc_model import BCVisionModel, BCStateModel, normalize, unnormalize
 from env import PickAndPlaceEnv
 
 u_clip = 4.0
-kp, kd = 1500.0, 4.0
+kp, kd = 200.0, 4.0
 
 @torch.no_grad()
-def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 5., render_video: bool = True):
+def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 5., render_video: bool = True, mode: str = 'vision'):
     device = next(model.parameters()).device
+    assert mode in ['state', 'vision']
 
     os.makedirs(out_dir, exist_ok=True)
 
     B = int(episodes)
-    env = PickAndPlaceEnv(seed=123, batch_size=B, dt=0.01)
+    env = PickAndPlaceEnv(seed=123, batch_size=B)
     max_steps = int(timeout_s / float(env.dt))
     env.reset(record_video=render_video)
     env.step(torch.zeros(B, 2))
 
     done_step = torch.full((B,), -1, dtype=torch.long)
     for t in range(max_steps):
-        frame = env.current_frame().to(torch.uint8)                 # [B,H,W,3]
-        img = frame.permute(0, 3, 1, 2).float().div_(255.0).to(device)  # [B,3,H,W]
         state = env.agent_pos.to(device)                            # [B,2]
         cmd = env.command.to(device)                                # [B,2]
-
         state_norm = normalize(state, model.state_min, model.state_max)
-        dpos_n = model(img, state_norm, cmd)                        # [B,2] (normalized)
+
+        if mode == 'vision':
+            frame = env.current_frame().to(torch.uint8)                 # [B,H,W,3]
+            img = frame.permute(0, 3, 1, 2).float().div_(255.0).to(device)  # [B,3,H,W]
+            dpos_n = model(img, state_norm, cmd)                        # [B,2] (normalized)
+        else:
+            obj_pos = torch.stack([env.objects_pos[b, int(env._target_object_idx[b].item())] for b in range(B)]).to(device)
+            goal_pos = torch.stack([env.goals_center[b, int(env._target_goal_idx[b].item())] for b in range(B)]).to(device)
+            obs = torch.cat([state_norm, obj_pos, goal_pos, cmd], dim=-1)
+            dpos_n = model(obs)
+
         dpos = unnormalize(dpos_n, model.dpos_min, model.dpos_max).to("cpu")
         u = kp * dpos - kd * env.agent_vel                          # [B,2]
         u = torch.clamp(u, -u_clip, u_clip)
@@ -76,8 +84,9 @@ def rollout(model, episodes: int = 2, out_dir: str = ".", timeout_s: float = 5.,
     return successes
 
 @torch.no_grad()
-def batch_eval(model, episodes: int = 100, timeout_s: float = 10.):
+def batch_eval(model, episodes: int = 100, timeout_s: float = 10., mode: str = 'vision'):
     device = next(model.parameters()).device
+    assert mode in ['state', 'vision']
 
     B = int(episodes)
     env = PickAndPlaceEnv(seed=123, batch_size=B)
@@ -86,13 +95,20 @@ def batch_eval(model, episodes: int = 100, timeout_s: float = 10.):
     env.step(torch.zeros(B, 2))
 
     for _ in range(max_steps):
-        frame = env.current_frame().to(torch.uint8)  # [B,H,W,3]
-        img = frame.permute(0, 3, 1, 2).float().div_(255.0).to(device)  # [B,3,H,W]
         state = env.agent_pos.to(device)  # [B,2]
         cmd = env.command.to(device)      # [B,2]
-
         state_norm = normalize(state, model.state_min, model.state_max)
-        dpos_n = model(img, state_norm, cmd)
+
+        if mode == 'vision':
+            frame = env.current_frame().to(torch.uint8)  # [B,H,W,3]
+            img = frame.permute(0, 3, 1, 2).float().div_(255.0).to(device)  # [B,3,H,W]
+            dpos_n = model(img, state_norm, cmd)
+        else:
+            obj_pos = torch.stack([env.objects_pos[b, int(env._target_object_idx[b].item())] for b in range(B)]).to(device)
+            goal_pos = torch.stack([env.goals_center[b, int(env._target_goal_idx[b].item())] for b in range(B)]).to(device)
+            obs = torch.cat([state_norm, obj_pos, goal_pos, cmd], dim=-1)
+            dpos_n = model(obs)
+
         dpos = unnormalize(dpos_n, model.dpos_min, model.dpos_max).to("cpu")
         u = kp * dpos - kd * env.agent_vel       # [B,2]
         u = torch.clamp(u, -u_clip, u_clip)
@@ -112,12 +128,14 @@ if __name__ == "__main__":
     parser.add_argument("--episodes", type=int, default=2)
     parser.add_argument("--out_dir", type=str, default=".")
     parser.add_argument("--no-video", dest="no_video", action="store_true", help="Disable video recording and saving")
+    parser.add_argument("--mode", type=str, default='vision', choices=['state', 'vision'], help='Model mode: state or vision')
     args = parser.parse_args()
 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BCModel().to(device)
-    state_dict = torch.load(args.ckpt, map_location=device)
+    model = (BCVisionModel() if args.mode == 'vision' else BCStateModel()).to(device)
+    checkpoint = torch.load(args.ckpt, map_location=device)
+    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
     model.load_state_dict(state_dict)
 
-    rollout(model, episodes=args.episodes, out_dir=args.out_dir, render_video=(not args.no_video), timeout_s=5.)
+    rollout(model, episodes=args.episodes, out_dir=args.out_dir, render_video=(not args.no_video), timeout_s=5., mode=args.mode)

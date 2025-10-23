@@ -3,7 +3,7 @@ import argparse
 import torch
 import numpy as np
 import matplotlib.pyplot as plt
-from bc_model import BCModel, normalize, unnormalize
+from bc_model import BCVisionModel, BCStateModel, normalize, unnormalize
 from env import PickAndPlaceEnv
 
 @torch.no_grad()
@@ -11,9 +11,11 @@ def visualize_vector_field(
     model,
     output_path: str = "vector_field.png",
     grid_size: int = 20,
-    num_conditions: int = 5
+    num_conditions: int = 5,
+    mode: str = 'vision'
 ):
     device = next(model.parameters()).device
+    assert mode in ['state', 'vision']
     model.eval()
     
     torch.manual_seed(42)
@@ -43,13 +45,20 @@ def visualize_vector_field(
                 env.agent_pos[0] = torch.tensor([x, y], device=device, dtype=env.dtype)
                 env.agent_vel[0] = torch.zeros(2, device=device, dtype=env.dtype)
                 
-                frame = env.current_frame().to(torch.uint8)
-                img = frame.permute(0, 3, 1, 2).float().div_(255.0).to(device)
                 state = env.agent_pos.to(device)
                 cmd = env.command.to(device)
-                
                 state_norm = normalize(state, model.state_min, model.state_max)
-                dpos_n = model(img, state_norm, cmd)
+                
+                if mode == 'vision':
+                    frame = env.current_frame().to(torch.uint8)
+                    img = frame.permute(0, 3, 1, 2).float().div_(255.0).to(device)
+                    dpos_n = model(img, state_norm, cmd)
+                else:
+                    obj_pos = env.object_pos.to(device)
+                    goal_pos = env.goal_center.to(device)
+                    obs = torch.cat([state_norm, obj_pos, goal_pos, cmd], dim=-1)
+                    dpos_n = model(obs)
+                
                 dpos = unnormalize(dpos_n, model.dpos_min, model.dpos_max)
                 dpos *= 100 # simulated kp gain
                 
@@ -84,17 +93,20 @@ if __name__ == "__main__":
     parser.add_argument("--output", type=str, default="vector_field.png")
     parser.add_argument("--grid_size", type=int, default=20)
     parser.add_argument("--num_conditions", type=int, default=5)
+    parser.add_argument("--mode", type=str, default='vision', choices=['state', 'vision'], help='Model mode: state or vision')
     args = parser.parse_args()
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = BCModel().to(device)
-    state_dict = torch.load(args.ckpt, map_location=device)
+    model = (BCVisionModel() if args.mode == 'vision' else BCStateModel()).to(device)
+    checkpoint = torch.load(args.ckpt, map_location=device)
+    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
     model.load_state_dict(state_dict)
     
     visualize_vector_field(
         model,
         args.output,
         args.grid_size,
-        args.num_conditions
+        args.num_conditions,
+        args.mode
     )
 

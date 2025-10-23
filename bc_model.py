@@ -267,7 +267,7 @@ class ResNet18Conv(nn.Module):
         return self.nets(inputs)
 
 
-class BCModel(nn.Module):
+class BCVisionModel(nn.Module):
     """
     Minimal behavior cloning model:
       inputs: image (3xHxW), state (pos[2]), command [object_color, goal_color] (2)
@@ -310,3 +310,35 @@ class BCModel(nn.Module):
         x = torch.cat([z, state, command], dim=-1)
         pred = self.nets['action_head'](x)
         return pred
+
+class BCStateModel(nn.Module):
+    """
+    Minimal behavior cloning model:
+      inputs: image (3xHxW), state (pos[2]), command [object_color, goal_color] (2)
+      output: delta_pos[2] between current and next timestep
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.obs_dim = 2 + 2 + 2 + 2 # agent | object | goal | command
+        self.hidden_dim = 512
+
+        self.nets = nn.ModuleDict()
+        action_head_net_list = []
+        action_head_net_list.extend([nn.Linear(self.obs_dim, self.hidden_dim), nn.ReLU(inplace=True)])
+        for _ in range(2):
+            action_head_net_list.extend([nn.Linear(self.hidden_dim, self.hidden_dim), nn.ReLU(inplace=True)])
+        action_head_net_list.append(nn.Linear(self.hidden_dim, 2))
+        self.nets['action_head'] = nn.Sequential(*action_head_net_list)
+
+        # normalization buffers
+        self.register_buffer('state_min', torch.zeros(2))
+        self.register_buffer('state_max', torch.ones(2))
+        self.register_buffer('dpos_min', torch.zeros(2))
+        self.register_buffer('dpos_max', torch.ones(2))
+
+    def forward(self, obs) -> torch.Tensor:
+        pred = self.nets['action_head'](obs)
+        return pred
+
+BCModel = BCVisionModel

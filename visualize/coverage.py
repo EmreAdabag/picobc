@@ -41,7 +41,7 @@ def visualize_agent_trajectories(dataset_path: str, output_path: str = None, num
         
         cmd = cmds[start_idx]
         obj_idx, goal_idx = int(cmd[0]), int(cmd[1])
-        obj_pos = torch.from_numpy(obj_positions[i])
+        obj_pos = torch.from_numpy(obj_positions[start_idx])
         goal_pos = torch.from_numpy(goal_positions[i])
         
         obj_px = int(obj_pos[0].item() * (resolution - 1))
