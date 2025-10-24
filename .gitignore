@@ -6,3 +6,4 @@ datasets/*
 ckpts/*
 **.out
 **.log
+.vscode/*
