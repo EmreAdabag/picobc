@@ -2,3 +2,8 @@
 **/wandb
 *.mp4
 **/__pycache__
+datasets/*
+ckpts/*
+**.out
+**.log
+.vscode/*
