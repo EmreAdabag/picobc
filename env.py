@@ -213,11 +213,15 @@ class PickAndPlaceEnv:
                 gx, gy = self.goals_center[b, gi, 0], self.goals_center[b, gi, 1]
                 mask_goal = (torch.abs(self.grid_x - gx) <= half) & (torch.abs(self.grid_y - gy) <= half)
                 frame[mask_goal] = self.goal_colors[gi]
+                if self.multi_task is False:
+                    break
             # Objects
             for oi in range(2):
                 ox, oy = self.objects_pos[b, oi, 0], self.objects_pos[b, oi, 1]
                 mask_obj = (self.grid_x - ox) ** 2 + (self.grid_y - oy) ** 2 <= obj_r ** 2
                 frame[mask_obj] = self.object_colors[oi]
+                if self.multi_task is False:
+                    break
             # Agent
             ax, ay = self.agent_pos[b, 0], self.agent_pos[b, 1]
             mask_agent = (self.grid_x - ax) ** 2 + (self.grid_y - ay) ** 2 <= ag_r ** 2

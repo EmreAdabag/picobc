@@ -5,6 +5,7 @@ import numpy as np
 import argparse
 import os
 import zarr
+from PIL import Image
 
 def visualize_agent_trajectories(dataset_path: str, output_path: str = None, num_demos: int = 0):
     assert os.path.exists(dataset_path)
@@ -71,8 +72,6 @@ def visualize_agent_trajectories(dataset_path: str, output_path: str = None, num
         suffix = f"_trajectories_{num_demos}demos" if num_demos > 0 else "_trajectories_all"
         output_path = f"{base_name}{suffix}.png"
 
-    # Save as image
-    from PIL import Image
     img = Image.fromarray(canvas.numpy())
     img.save(output_path)
     print(f"Saved agent trajectory visualization to {output_path}")

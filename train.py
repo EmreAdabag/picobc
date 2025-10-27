@@ -14,6 +14,7 @@ import wandb
 
 
 USE_WANDB=0
+VALIDATE=0
 
 def save_checkpoint(model, optimizer, epoch, step, out_dir, filename):
     path = os.path.join(out_dir, filename)
@@ -69,16 +70,18 @@ class ZarrDeltaDataset(Dataset):
         self.indices = indices
         
         dpos_all = states[1:] - states[:-1]
-        state_arr = states[indices]
-        dpos_arr = dpos_all[indices]
+        _state_arr = states[indices]
+        _dpos_arr = dpos_all[indices]
         
-        self.state_min = state_arr.min(axis=0)
-        self.state_max = state_arr.max(axis=0)
-        self.dpos_min = dpos_arr.min(axis=0)
-        self.dpos_max = dpos_arr.max(axis=0)
+        self.state_min = _state_arr.min(axis=0)
+        self.state_max = _state_arr.max(axis=0)
+        self.dpos_min = _dpos_arr.min(axis=0)
+        self.dpos_max = _dpos_arr.max(axis=0)
         
         self.states_norm = normalize(states, self.state_min, self.state_max)
         self.dpos_norm = normalize(dpos_all, self.dpos_min, self.dpos_max)
+        self.goals_norm = normalize(goal_positions, self.state_min, self.state_max)
+        self.obj_positions_norm = normalize(obj_positions, self.state_min, self.state_max)
         
         print(f"Loaded {len(indices)} transitions")
 
@@ -96,9 +99,9 @@ class ZarrDeltaDataset(Dataset):
             return img, state_t_norm, cmd_t, dpos_norm
         else:
             state_t_norm = torch.from_numpy(self.states_norm[t]).float()
-            obj_pos_t = torch.from_numpy(self.obj_positions[t]).float()
+            obj_pos_t = torch.from_numpy(self.obj_positions_norm[t]).float()
             ep_idx = next(i for i, end in enumerate(self.episode_ends) if t < end)
-            goal_pos_t = torch.from_numpy(self.goal_positions[ep_idx]).float()
+            goal_pos_t = torch.from_numpy(self.goals_norm[ep_idx]).float()
             cmd_t = torch.from_numpy(self.cmds[t]).float()
             obs = torch.cat([state_t_norm, obj_pos_t, goal_pos_t, cmd_t])
             return obs, dpos_norm
@@ -210,7 +213,7 @@ def train(dataset_path: str, out_dir: str, steps: int, batch_size: int, lr: floa
         print(f"epoch {global_ep}/{epochs} | loss={train_loss:.6f}")
         
         # Validation
-        if len(val_dl) > 0:
+        if VALIDATE and len(val_dl) > 0:
             model.eval()
             with torch.no_grad():
                 v_total, v_count = 0.0, 0

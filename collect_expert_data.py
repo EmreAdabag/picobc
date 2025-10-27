@@ -69,13 +69,6 @@ def collect_expert_dataset(N: int, path: str, multi_task: bool):
         active = torch.ones(B, dtype=torch.bool)
         done_step = torch.full((B,), -1, dtype=torch.long)
         t = 0
-        # frames_all[t] = env.current_frame().to("cpu")
-        # poss_all[t] = env.agent_pos.to("cpu")
-        # u_all[t] = torch.zeros(B, 2)
-        # for b in range(B):
-        #     obj_idx = int(env._target_object_idx[b].item())
-        #     obj_pos_all[t, b] = env.objects_pos[b, obj_idx].to(torch.float32).to("cpu")
-        # t += 1
         
         while bool(active.any()) and t < max_steps:
             expert_ctrl_pos_all[t] = torch.where((~env.picked).unsqueeze(-1), env.object_pos, env.goal_center)
@@ -123,7 +116,7 @@ def collect_expert_dataset(N: int, path: str, multi_task: bool):
     root['meta/goal_pos'] = np.array(goal_positions)
     root['meta/dt'] = env.dt.numpy().reshape(1)
     root['meta/multi_task'] = np.array(env.multi_task).reshape(1)
-    print(f"wrote {N} demonstrations totalling {total_samples} datapoints")
+    print(f"wrote {N} demonstrations totalling {total_samples} datapoints, {total_samples / N} datapoints per demo")
 
 def generate_expert_demo_video(batch_size: int = 4, episodes: int = 1, multi_task=False):
     # Always batched env; all tensors have leading batch dim
@@ -154,4 +147,4 @@ if __name__ == "__main__":
     demos = 100
     # generate_expert_demo_video(multi_task=multi_task)
     if 1:
-        collect_expert_dataset  (demos, f"datasets/expert_{demos}_singletask_slow.zarr", multi_task=multi_task)
+        collect_expert_dataset(demos, f"datasets/expert_{demos}.zarr", multi_task=multi_task)
