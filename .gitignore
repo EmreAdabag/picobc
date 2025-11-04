@@ -7,3 +7,5 @@ ckpts/*
 **.out
 **.log
 .vscode/*
+*dataset*
+*output*
