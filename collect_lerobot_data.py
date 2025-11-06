@@ -55,9 +55,7 @@ def collect_lerobot_dataset(
         fps=fps,
         features=features,
         root=root,
-        use_videos=True,
-        image_writer_threads=4,
-        batch_encoding_size=1,
+        use_videos=True
     )
 
     max_steps = int(10.0 / float(env_boot.dt))
@@ -66,14 +64,15 @@ def collect_lerobot_dataset(
         print(f"\n\nstarting task {i}\n")
 
         env = PickAndPlaceEnv(task_type=task_type, device=device, record_video=False, dt=dt, seed=seed)
-        info = env.command_info(0)
-        if (task_type=='place'):
-            task_str = f"place the {info['object_name']} on the gold star"
-        else:
-            task_str = f"pick up the {info['object_name']}"
 
         for _ in range(episodes_per_task):
             env.reset(task_type=task_type, obj_idx=obj_idx)
+            info = env.command_info(0)
+            if (task_type=='place'):
+                task_str = f"place the {info['object_name']} on the gold star"
+            else:
+                task_str = f"pick up the {info['object_name']}"
+            
             ctrl = ExpertController(task_type)
                 
             steps = 0
@@ -118,7 +117,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    tasks = [(obj_id, tsk) for obj_id in range(args.obj_id_s, args.obj_id_e) for tsk in ['pick']]
+    tasks = [(obj_id, tsk) for obj_id in range(args.obj_id_s, args.obj_id_e) for tsk in ['pick', 'place']]
 
     collect_lerobot_dataset(
         episodes_per_task=args.episodes_per_task,
