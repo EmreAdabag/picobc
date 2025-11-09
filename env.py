@@ -26,9 +26,7 @@ class PickAndPlaceEnv:
         seed: int = 0,
         batch_size: int = 1,
         dt: float = 0.05,
-        task_type: str = "place",
         objects_dir: str | Path = "objects",
-        goal_sprite_path: str | Path = "star.png",
         sprite_size_px: int = 32,
         image_size: int = 256,
         record_video: bool = False,
@@ -43,10 +41,6 @@ class PickAndPlaceEnv:
         self.dt = torch.tensor(dt, device=self.device, dtype=self.dtype)
         self.mass = torch.tensor(1.0, device=self.device, dtype=self.dtype)
         self.object_mass = torch.tensor(2.0, device=self.device, dtype=self.dtype)
-
-        # Task
-        assert task_type in ("pick", "place"), "task_type must be 'pick' or 'place'"
-        self.task_type = task_type
 
         # Rendering
         self.H = int(image_size)
@@ -73,15 +67,12 @@ class PickAndPlaceEnv:
         self.objects_dir = Path(objects_dir)
         self.sprites: List[dict] = self._load_sprites(self.objects_dir, self.sprite_size_px)
         assert len(self.sprites) > 0, f"No PNG sprites found in '{self.objects_dir}'."
-        # Goal sprite is loaded from a separate file (e.g., star.png)
-        self.goal_sprite_path = str(goal_sprite_path)
         # Pre-stack sprites for batched gather: [N, h*w, 4] (rgb 0..255, alpha 0..1)
         self.sprite_h = self.sprite_w = int(self.sprite_size_px)
         self.sprites_flat4 = torch.stack([s["flat4"] for s in self.sprites], dim=0).to(self.device)
-        
-        self.goal_sprite_flat4 = self._load_sprite_file(self.goal_sprite_path, self.sprite_size_px)[
-            "flat4"
-        ].to(self.device)  # [h*w,4]
+        # Use one of the object sprites as the initial goal sprite
+        self.goal_id = 0
+        self.goal_sprite_flat4 = self.sprites[self.goal_id]["flat4"]
 
         # State
         self.agent_pos = None         # [B,2]
@@ -108,16 +99,21 @@ class PickAndPlaceEnv:
         self.reset()
 
     # ---- environment API ----
-    def reset(self, task_type=None, obj_idx=None):
+    def reset(self, obj_idx=None, goal_idx=None):
         B = self.B
         def r2(n=B):
             return torch.rand(n, 2, generator=self.rng, device=self.device).to(self.dtype)
 
+        # Optionally override goal sprite by an object sprite
+        if goal_idx is not None:
+            # Use the selected object sprite as the goal sprite for this episode
+            gidx = int(goal_idx)
+            self.goal_id = gidx
+            self.goal_sprite_flat4 = self.sprites[gidx]["flat4"]
+
         self.agent_pos = r2()
-        if task_type is not None and task_type=='place':
-            self.object_pos = self.agent_pos.clone()
-        else:
-            self.object_pos = r2()
+        # Always start not picked with gripper open; object at random position
+        self.object_pos = r2()
         self.goal_pos = r2()
         
         self.agent_vel = torch.zeros(B, 2, device=self.device, dtype=self.dtype)
@@ -128,11 +124,11 @@ class PickAndPlaceEnv:
         else:
             self.object_id = torch.randint(0, len(self.sprites), (B,), device=self.device, generator=self.rng)
 
-        # Task flags
+        # Task flags: start with open gripper and not picked
         self.picked = torch.zeros(B, dtype=torch.bool, device=self.device)
+        self.gripper_closed = torch.zeros(B, dtype=torch.bool, device=self.device)
         self.delivered = torch.zeros(B, dtype=torch.bool, device=self.device)
         self.success = torch.zeros(B, dtype=torch.bool, device=self.device)
-        self.gripper_closed = torch.zeros(B, dtype=torch.bool, device=self.device)
 
         # Distractors: sample once per env and keep fixed
         if self.max_distractors > 0:
@@ -142,12 +138,9 @@ class PickAndPlaceEnv:
                 torch.arange(K, device=self.device).view(1, K) < num_d.view(B, 1)
             )
             N = len(self.sprites)
-            if N > 1:
-                base = torch.randint(0, N - 1, (B, K), device=self.device, generator=self.rng)
-                oid = self.object_id.view(B, 1)
-                self.distractor_ids = base + (base >= oid).to(torch.long)
-            else:
-                self.distractor_ids = torch.zeros(B, K, device=self.device, dtype=torch.long)
+            base = torch.randint(0, N - 1, (B, K), device=self.device, generator=self.rng)
+            oid = self.object_id.view(B, 1)
+            self.distractor_ids = base + (base >= oid).to(torch.long)
             self.distractor_pos = torch.rand(B, K, 2, device=self.device, generator=self.rng).to(self.dtype)
         else:
             self.distractor_active = None
@@ -193,7 +186,8 @@ class PickAndPlaceEnv:
         just_dropped = (self.picked & (~self.delivered)) & opening
         self.delivered = self.delivered | (just_dropped & (drop_dist <= self.drop_radius))
 
-        self.success = self.picked.clone() * (self.task_type == "pick") + self.delivered.clone() * (self.task_type == "place")
+        # Unified task: success only when delivered (pick + place)
+        self.success = self.delivered.clone()
 
         if self._record:
             self._frames.append(self.current_frame())
@@ -284,15 +278,16 @@ class PickAndPlaceEnv:
         px_to_world = 1.0 / float(max(self.H, self.W) - 1)
         return torch.tensor(radius_px * px_to_world, device=self.device, dtype=self.dtype)
 
-    def command_info(self, b: int = 0) -> dict:
-        assert 0 <= b < self.B, "batch index out of range"
-        oid = int(self.object_id[b].item())
-        sp = self.sprites[oid]
-        return {
-            "object_id": oid,
-            "object_name": sp["name"],
-            "object_file": sp["path"],
-        }
+    def command(self) -> str:
+        # Assumes batch size 1 usage for commands
+        oid = int(self.object_id[0].item())
+        obj_name = self.sprites[oid]["name"]
+        goal_name = self.sprites[int(self.goal_id)]["name"]
+        return f"place the {obj_name} on the {goal_name}"
+
+    # Backward-compat alias
+    def command_info(self, b: int = 0) -> str:
+        return self.command()
 
     def save_video(self, path: str):
         fps = int(1.0 / float(self.dt))
@@ -307,7 +302,7 @@ class PickAndPlaceEnv:
             "video_path": path,
             "fps": int(fps),
             "batch_size": int(self.B),
-            "objects": [self.command_info(b) for b in range(self.B)],
+            "command": self.command(),
         }
         sidecar_path = os.path.splitext(path)[0] + ".json"
         with open(sidecar_path, "w", encoding="utf-8") as fh:

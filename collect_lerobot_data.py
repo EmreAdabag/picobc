@@ -1,4 +1,5 @@
 import sys
+import json as _json
 from pathlib import Path
 import numpy as np
 import torch
@@ -9,16 +10,17 @@ import argparse
 
 def collect_lerobot_dataset(
     episodes_per_task: int,
-    repo_id: str,
     root: str | Path,
     tasks: list,
     seed: int = 0,
+    max_distractors: int = 0,
+    image_size: int = 0,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Bootstrap env to read rendering params
     dt = 0.01
-    env_boot = PickAndPlaceEnv(task_type="place", device=device, record_video=False, dt=dt)
+    env_boot = PickAndPlaceEnv(device=device, record_video=False, dt=dt, image_size=image_size, max_distractors=max_distractors)
     fps = int(1.0 / float(env_boot.dt))
     H, W = int(env_boot.H), int(env_boot.W)
 
@@ -51,7 +53,7 @@ def collect_lerobot_dataset(
 
     root = Path(root)
     ds = LeRobotDataset.create(
-        repo_id=repo_id,
+        repo_id='null',
         fps=fps,
         features=features,
         root=root,
@@ -59,28 +61,25 @@ def collect_lerobot_dataset(
     )
 
     max_steps = int(10.0 / float(env_boot.dt))
+    episode_task_records = []
 
-    for i, (obj_idx, task_type) in enumerate(tasks):
+    for i, (obj_idx, goal_idx) in enumerate(tasks):
         print(f"\n\nstarting task {i}\n")
 
-        env = PickAndPlaceEnv(task_type=task_type, device=device, record_video=False, dt=dt, seed=seed)
+        env = PickAndPlaceEnv(device=device, record_video=False, dt=dt, seed=seed, image_size=image_size, max_distractors=max_distractors)
 
         for _ in range(episodes_per_task):
-            env.reset(task_type=task_type, obj_idx=obj_idx)
-            info = env.command_info(0)
-            if (task_type=='place'):
-                task_str = f"place the {info['object_name']} on the gold star"
-            else:
-                task_str = f"pick up the {info['object_name']}"
-            
-            ctrl = ExpertController(task_type)
+            # Use goal_idx to render the goal with another object sprite
+            env.reset(obj_idx=obj_idx, goal_idx=goal_idx)
+            task_str = env.command()
+
+            ctrl = ExpertController()
                 
             steps = 0
             steps_after_success = 0
             while steps < max_steps:
                 xk = env.agent_pos.clone()
                 
-
                 env.step(ctrl.act(env))
 
                 img = env.current_frame().to("cpu").numpy()[0]
@@ -103,26 +102,41 @@ def collect_lerobot_dataset(
                 steps += 1
 
             ds.save_episode()
+            episode_task_records.append({
+                "object_id": int(env.object_id[0].item()),
+                "goal_id": int(env.goal_id),
+                "task": task_str,
+            })
 
     ds.finalize()
-    print(f"LeRobot dataset recorded: repo_id='{repo_id}', root='{(root / repo_id)}', episodes={episodes_per_task*len(tasks)}, fps={fps}")
+    
+    # Save episode-level task strings next to the dataset
+    sidecar_path = Path(root) / "episode_tasks.json"
+    with open(sidecar_path, "w", encoding="utf-8") as fh:
+        _json.dump(episode_task_records, fh, indent=2)
+    print(f"LeRobot dataset recorded: root='{root}', episodes={episodes_per_task*len(tasks)}, fps={fps}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Roll out expert policy and save a video")
-    parser.add_argument("--obj_id_s", type=int, default=0)
-    parser.add_argument("--obj_id_e", type=int, default=1)
+    parser = argparse.ArgumentParser(description="Collect pick+place demos for a fixed object over a goal range")
+    parser.add_argument("--object_id", type=int, required=True)
+    parser.add_argument("--goal_id_s", type=int, required=True)
+    parser.add_argument("--goal_id_e", type=int, required=True)
     parser.add_argument("--root", type=str, default="datasets/tmp")
     parser.add_argument("--episodes_per_task", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--max_distractors", type=int, default=3)
+    parser.add_argument("--image_size", type=int, default=256)
     args = parser.parse_args()
 
-    tasks = [(obj_id, tsk) for obj_id in range(args.obj_id_s, args.obj_id_e) for tsk in ['pick', 'place']]
+    # Build tasks: fixed object against goal range, skipping goal==object
+    tasks = [(args.object_id, g) for g in range(args.goal_id_s, args.goal_id_e) if g != args.object_id]
 
     collect_lerobot_dataset(
         episodes_per_task=args.episodes_per_task,
-        repo_id="null",
         root=args.root,
         tasks=tasks,
-        seed=args.seed
+        seed=args.seed,
+        max_distractors=args.max_distractors,
+        image_size=args.image_size,
     )
