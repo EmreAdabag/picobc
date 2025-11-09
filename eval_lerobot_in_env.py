@@ -16,7 +16,6 @@ def main():
     parser = argparse.ArgumentParser(description="Roll out a SmolVLA policy in PickAndPlaceEnv")
     parser.add_argument("--model_path", type=str, default="model/pretrained_model")
     parser.add_argument("--episodes", type=int, default=1)
-    parser.add_argument("--task", type=str, default="place", choices=["pick", "place"])
     parser.add_argument("--save_video", type=bool, default=True)
     parser.add_argument("--dt", type=float, default=0.01)
     parser.add_argument("--max_seconds", type=float, default=10.0)
@@ -42,7 +41,7 @@ def main():
         preprocessor_overrides={"device_processor": {"device": str(device)}},
     )
 
-    env = PickAndPlaceEnv(batch_size=1, task_type=args.task, device=device, record_video=args.save_video, dt=args.dt, seed=123456)
+    env = PickAndPlaceEnv(batch_size=1, device=device, record_video=args.save_video, dt=args.dt, seed=123456)
 
     max_steps = int(args.max_seconds / float(env.dt))
     kp, kd = 500.0, 6.0
@@ -50,7 +49,7 @@ def main():
 
     for ep in range(args.episodes):
         # Reset env and policy queues each episode
-        env.reset(task_type=args.task, obj_idx=args.object_id)
+        env.reset(obj_idx=args.object_id)
         policy.reset()
         task_str = env.command()
         print(task_str)
