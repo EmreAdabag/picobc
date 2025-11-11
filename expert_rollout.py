@@ -10,9 +10,9 @@ class ExpertController:
 
     def __init__(self):
         # task_type kept for backward compatibility but ignored
-        self.kp = 10.0
+        self.kp = 14.0
         self.kd = 6.0
-        self.kp_loaded = 10.0
+        self.kp_loaded = 14.0
         self.kd_loaded = 12.0
         self.u_clip = 4.0
 
@@ -29,10 +29,10 @@ class ExpertController:
         # Gripper schedule: close near object; hold while carrying; open near goal to drop
         dist_obj = torch.linalg.vector_norm(env.agent_pos - env.object_pos, dim=-1)
         dist_goal = torch.linalg.vector_norm(env.agent_pos - env.goal_pos, dim=-1)
-        pick_thresh = 0.5 * float(env.pick_radius.item())
-        drop_thresh = 0.5 * float(env.drop_radius.item())
+        pick_thresh = 0.2 * float(env.pick_radius.item())
+        drop_thresh = 0.2 * float(env.drop_radius.item())
 
-        close_to_obj = (~env.picked) & (dist_obj <= pick_thresh)
+        close_to_obj = (~env.picked) & (dist_obj <= pick_thresh) & (~env.delivered)
         carry_phase = env.picked & (~env.delivered)
         open_to_drop = carry_phase & (dist_goal <= drop_thresh)
 

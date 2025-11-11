@@ -90,7 +90,6 @@ class PickAndPlaceEnv:
         # Distractors (fixed per env after reset)
         self.distractor_ids = None        # [B, K] long
         self.distractor_pos = None        # [B, K, 2] float in world coords 0..1
-        self.distractor_active = None     # [B, K] bool
 
         # Recording
         self._record = record_video
@@ -102,7 +101,7 @@ class PickAndPlaceEnv:
     def reset(self, obj_idx=None, goal_idx=None):
         B = self.B
         def r2(n=B):
-            return torch.rand(n, 2, generator=self.rng, device=self.device).to(self.dtype)
+            return torch.clip(torch.rand(n, 2, generator=self.rng, device=self.device).to(self.dtype) * 1.04 - 0.02, min=0., max=1.)
 
         # Optionally override goal sprite by an object sprite
         if goal_idx is not None:
@@ -133,17 +132,19 @@ class PickAndPlaceEnv:
         # Distractors: sample once per env and keep fixed
         if self.max_distractors > 0:
             K = self.max_distractors
-            num_d = torch.randint(0, K + 1, (B,), device=self.device, generator=self.rng)
-            self.distractor_active = (
-                torch.arange(K, device=self.device).view(1, K) < num_d.view(B, 1)
-            )
             N = len(self.sprites)
-            base = torch.randint(0, N - 1, (B, K), device=self.device, generator=self.rng)
-            oid = self.object_id.view(B, 1)
-            self.distractor_ids = base + (base >= oid).to(torch.long)
-            self.distractor_pos = torch.rand(B, K, 2, device=self.device, generator=self.rng).to(self.dtype)
+            B = self.object_id.shape[0]
+
+            forbidden = torch.stack([self.object_id, torch.full((B,), self.goal_id, device=self.device)], dim=1)  # (B, 2)
+            base = torch.randint(0, N - 2, (B, K), device=self.device, generator=self.rng)
+
+            # shift up once per forbidden id
+            base += (base >= forbidden[:, [0]]).long()
+            base += (base >= forbidden[:, [1]]).long()
+
+            self.distractor_ids = base
+            self.distractor_pos = torch.rand(B, K, 2, device=self.device, generator=self.rng).to(dtype=self.dtype)
         else:
-            self.distractor_active = None
             self.distractor_ids = None
             self.distractor_pos = None
 
@@ -157,34 +158,39 @@ class PickAndPlaceEnv:
         a = action.to(device=self.device, dtype=self.dtype)
         u = a.view(self.B, -1)[:, :2]
         prev_grip = self.gripper_closed.clone()
-        self.gripper_closed = (a.view(self.B, -1)[:, 2] > 0.5)
+        gripper_close_cmd = (a.view(self.B, -1)[:, 2] > 0.5)
 
-        carrying = self.picked & (~self.delivered) & self.gripper_closed
-        agent_mass = self.mass + carrying * self.object_mass
+        # Use previous step's attachment to determine mass during this integration
+        total_mass = self.mass + prev_grip * self.object_mass
 
-        # Physics
-        self.agent_vel = self.agent_vel + (u / agent_mass.unsqueeze(1)) * self.dt
+        # Physics integration
+        self.agent_vel = self.agent_vel + (u / total_mass.unsqueeze(1)) * self.dt
         self.agent_pos = (self.agent_pos + self.agent_vel * self.dt).clamp(0.0, 1.0)
 
-        # Attach if carrying (vectorized)
-        carry_mask = carrying.unsqueeze(1)
-        self.object_pos = torch.where(carry_mask, self.agent_pos, self.object_pos)
-        self.object_vel = torch.where(carry_mask, self.agent_vel, self.object_vel)
+        # Carry object during this step if it was attached at the start of the step
+        self.object_pos = torch.where(prev_grip.unsqueeze(1), self.agent_pos, self.object_pos)
+        self.object_vel = torch.where(prev_grip.unsqueeze(1), self.agent_vel, self.object_vel)
 
-        # Distances
-        pick_dist = torch.linalg.vector_norm(self.agent_pos - self.object_pos, dim=-1)
-        drop_dist = torch.linalg.vector_norm(self.agent_pos - self.goal_pos, dim=-1)
+        # Evaluate drop at release (end-of-step)
+        drop_dist_now = torch.linalg.vector_norm(self.agent_pos - self.goal_pos, dim=-1)
 
-        closing = (~prev_grip) & self.gripper_closed
-        can_pick = (~self.picked) & closing & (pick_dist <= self.pick_radius)
-        self.picked = self.picked | can_pick
-        pick_mask = can_pick.unsqueeze(1)
-        self.object_pos = torch.where(pick_mask, self.agent_pos, self.object_pos)
-        self.object_vel = torch.where(pick_mask, self.agent_vel, self.object_vel)
+        # Decide realized gripper state after integration
+        pick_dist_now = torch.linalg.vector_norm(self.agent_pos - self.object_pos, dim=-1)
+        close_attempt = (~prev_grip) & gripper_close_cmd
+        success_close = close_attempt & (pick_dist_now <= self.pick_radius)
+        new_grip = (prev_grip & gripper_close_cmd) | success_close
 
-        opening = prev_grip & (~self.gripper_closed)
-        just_dropped = (self.picked & (~self.delivered)) & opening
-        self.delivered = self.delivered | (just_dropped & (drop_dist <= self.drop_radius))
+        # On successful close, snap object to agent at end-of-step
+        self.object_pos = torch.where(success_close.unsqueeze(1), self.agent_pos, self.object_pos)
+        self.object_vel = torch.where(success_close.unsqueeze(1), self.agent_vel, self.object_vel)
+
+        # Opening is based on realized gripper state
+        opening = prev_grip & (~new_grip)
+        self.delivered = self.delivered | (opening & (drop_dist_now <= self.drop_radius))
+
+        # Update attachment flags
+        self.gripper_closed = new_grip
+        self.picked = new_grip
 
         # Unified task: success only when delivered (pick + place)
         self.success = self.delivered.clone()
@@ -200,31 +206,13 @@ class PickAndPlaceEnv:
         frames = self.bg_color.to(self.device).to(torch.float32).view(1, 1, 1, 3).expand(B, self.H, self.W, 3).clone()
         ag_r = self._world_radius_to_px(self.agent_radius_px)
 
-        # ---- Batched goal sprite compositing (same sprite across batch) ----
-        cx_g = (self.goal_pos[:, 0].view(B, 1, 1) * float(self.W - 1))
-        cy_g = (self.goal_pos[:, 1].view(B, 1, 1) * float(self.H - 1))
-        dx_g = self.pix_x - cx_g
-        dy_g = self.pix_y - cy_g
         half_w = float(self.sprite_w) / 2.0
         half_h = float(self.sprite_h) / 2.0
-        inside_g = (dx_g.abs() <= half_w) & (dy_g.abs() <= half_h)
-        sx_g = torch.clamp((dx_g + half_w).floor().to(torch.long), 0, self.sprite_w - 1)
-        sy_g = torch.clamp((dy_g + half_h).floor().to(torch.long), 0, self.sprite_h - 1)
-        idx_lin_g = (sy_g * self.sprite_w + sx_g).view(B, -1, 1)  # [B,H*W,1]
-        goal_flat = self.goal_sprite_flat4.unsqueeze(0).expand(B, -1, -1)  # [B,h*w,4]
-        goal_sel = torch.gather(goal_flat, 1, idx_lin_g.expand(-1, -1, 4)).view(B, self.H, self.W, 4)
-        goal_sel = goal_sel * inside_g.unsqueeze(-1).to(goal_sel.dtype)
-        alpha_g = goal_sel[..., 3:4]
-        rgb_g = goal_sel[..., :3]
-        frames = rgb_g * alpha_g + frames * (1.0 - alpha_g)
 
         # ---- Fixed distractor sprites per env (0..max_distractors) ----
         if self.max_distractors > 0 and self.distractor_ids is not None:
             K = self.max_distractors
             for k in range(K):
-                active = self.distractor_active[:, k].view(B, 1, 1)
-                if not torch.any(active):
-                    continue
                 didx = self.distractor_ids[:, k]
                 cx_d = (self.distractor_pos[:, k, 0].view(B, 1, 1) * float(self.W - 1))
                 cy_d = (self.distractor_pos[:, k, 1].view(B, 1, 1) * float(self.H - 1))
@@ -236,10 +224,26 @@ class PickAndPlaceEnv:
                 idx_lin_d = (sy_d * self.sprite_w + sx_d).view(B, -1, 1)
                 dflat = self.sprites_flat4.index_select(0, didx)  # [B,h*w,4]
                 dsel = torch.gather(dflat, 1, idx_lin_d.expand(-1, -1, 4)).view(B, self.H, self.W, 4)
-                dsel = dsel * (inside_d & active).unsqueeze(-1).to(dsel.dtype)
+                dsel = dsel * (inside_d).unsqueeze(-1).to(dsel.dtype)
                 alpha_d = dsel[..., 3:4]
                 rgb_d = dsel[..., :3]
                 frames = rgb_d * alpha_d + frames * (1.0 - alpha_d)
+
+        # ---- Batched goal sprite compositing (same sprite across batch) ----
+        cx_g = (self.goal_pos[:, 0].view(B, 1, 1) * float(self.W - 1))
+        cy_g = (self.goal_pos[:, 1].view(B, 1, 1) * float(self.H - 1))
+        dx_g = self.pix_x - cx_g
+        dy_g = self.pix_y - cy_g
+        inside_g = (dx_g.abs() <= half_w) & (dy_g.abs() <= half_h)
+        sx_g = torch.clamp((dx_g + half_w).floor().to(torch.long), 0, self.sprite_w - 1)
+        sy_g = torch.clamp((dy_g + half_h).floor().to(torch.long), 0, self.sprite_h - 1)
+        idx_lin_g = (sy_g * self.sprite_w + sx_g).view(B, -1, 1)  # [B,H*W,1]
+        goal_flat = self.goal_sprite_flat4.unsqueeze(0).expand(B, -1, -1)  # [B,h*w,4]
+        goal_sel = torch.gather(goal_flat, 1, idx_lin_g.expand(-1, -1, 4)).view(B, self.H, self.W, 4)
+        goal_sel = goal_sel * inside_g.unsqueeze(-1).to(goal_sel.dtype)
+        alpha_g = goal_sel[..., 3:4]
+        rgb_g = goal_sel[..., :3]
+        frames = rgb_g * alpha_g + frames * (1.0 - alpha_g)
 
         # ---- Batched object sprite compositing (sprite differs per batch) ----
         cx_o = (self.object_pos[:, 0].view(B, 1, 1) * float(self.W - 1))
