@@ -1,7 +1,6 @@
 {
     "dataset": {
         "repo_id": "null",
-        "root": "datasets/justpick",
         "image_transforms": {
             "enable": false,
             "max_num_transforms": 3,

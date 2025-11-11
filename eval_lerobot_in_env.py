@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--dt", type=float, default=0.01)
     parser.add_argument("--max_seconds", type=float, default=10.0)
     parser.add_argument("--object_id", type=int, default=None)
+    parser.add_argument("--goal_id", type=int, default=None)
     parser.add_argument("--model_type", type=str, default='smolvla')
     parser.add_argument("--save_prefix", type=str, default='', help="")
     args = parser.parse_args()
@@ -44,12 +45,12 @@ def main():
     env = PickAndPlaceEnv(batch_size=1, device=device, record_video=args.save_video, dt=args.dt, seed=123456)
 
     max_steps = int(args.max_seconds / float(env.dt))
-    kp, kd = 500.0, 6.0
+    kp, kd = 200.0, 3.0
     u_clip = 4.0
 
     for ep in range(args.episodes):
         # Reset env and policy queues each episode
-        env.reset(obj_idx=args.object_id)
+        env.reset(obj_idx=args.object_id, goal_idx=args.goal_id)
         policy.reset()
         task_str = env.command()
         print(task_str)

@@ -285,10 +285,6 @@ class PickAndPlaceEnv:
         goal_name = self.sprites[int(self.goal_id)]["name"]
         return f"place the {obj_name} on the {goal_name}"
 
-    # Backward-compat alias
-    def command_info(self, b: int = 0) -> str:
-        return self.command()
-
     def save_video(self, path: str):
         fps = int(1.0 / float(self.dt))
         assert len(self._frames) > 0, "No frames recorded. Call reset(record_video=True) and step()."
