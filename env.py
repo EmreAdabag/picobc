@@ -335,3 +335,42 @@ class PickAndPlaceEnv:
         alpha_f = (rgba_u8[..., 3].to(torch.float32) / 255.0).to(self.device)
         flat4 = torch.cat([rgb_f, alpha_f.unsqueeze(-1)], dim=-1).view(-1, 4)
         return {"name": p.stem, "path": str(p), "flat4": flat4}
+
+    def get_env_state(self):
+        state = {
+            "agent_pos": self.agent_pos.cpu(),
+            "agent_vel": self.agent_vel.cpu(),
+            "object_pos": self.object_pos.cpu(),
+            "object_vel": self.object_vel.cpu(),
+            "goal_pos": self.goal_pos.cpu(),
+            "object_id": self.object_id.cpu(),
+            "picked": self.picked.cpu(),
+            "delivered": self.delivered.cpu(),
+            "success": self.success.cpu(),
+            "gripper_closed": self.gripper_closed.cpu(),
+            "goal_id": torch.tensor(self.goal_id),
+        }
+        if self.distractor_ids is not None:
+            state["distractor_ids"] = self.distractor_ids.cpu()
+            state["distractor_pos"] = self.distractor_pos.cpu()
+        return state
+
+    def set_env_state(self, state):
+        self.agent_pos = state["agent_pos"].to(device=self.device, dtype=self.dtype)
+        self.agent_vel = state["agent_vel"].to(device=self.device, dtype=self.dtype)
+        self.object_pos = state["object_pos"].to(device=self.device, dtype=self.dtype)
+        self.object_vel = state["object_vel"].to(device=self.device, dtype=self.dtype)
+        self.goal_pos = state["goal_pos"].to(device=self.device, dtype=self.dtype)
+        self.object_id = state["object_id"].to(device=self.device, dtype=torch.long)
+        self.picked = state["picked"].to(device=self.device, dtype=torch.bool)
+        self.delivered = state["delivered"].to(device=self.device, dtype=torch.bool)
+        self.success = state["success"].to(device=self.device, dtype=torch.bool)
+        self.gripper_closed = state["gripper_closed"].to(device=self.device, dtype=torch.bool)
+        self.goal_id = int(state["goal_id"].item())
+        self.goal_sprite_flat4 = self.sprites[self.goal_id]["flat4"]
+        if "distractor_ids" in state:
+            self.distractor_ids = state["distractor_ids"].to(device=self.device, dtype=torch.long)
+            self.distractor_pos = state["distractor_pos"].to(device=self.device, dtype=self.dtype)
+        else:
+            self.distractor_ids = None
+            self.distractor_pos = None
