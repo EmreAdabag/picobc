@@ -52,8 +52,8 @@ class PickAndPlaceEnv:
         self.max_distractors = int(max(0, max_distractors))
 
         # Distances (world units 0..1)
-        self.pick_radius = torch.tensor(0.02, device=self.device, dtype=self.dtype)
-        self.drop_radius = torch.tensor(0.02, device=self.device, dtype=self.dtype)
+        self.pick_radius = torch.tensor(0.04, device=self.device, dtype=self.dtype)
+        self.drop_radius = torch.tensor(0.04, device=self.device, dtype=self.dtype)
 
         # Precompute pixel grid for agent circle
         ys = torch.linspace(0.0, 1.0, self.H, device=self.device, dtype=self.dtype)

@@ -26,6 +26,8 @@ def main():
     parser.add_argument("--save_prefix", type=str, default='', help="")
     parser.add_argument("--obj_lo", type=int, default=0)
     parser.add_argument("--obj_hi", type=int, default=2)
+    parser.add_argument("--goal_lo", type=int, default=0)
+    parser.add_argument("--goal_hi", type=int, default=2)
     parser.add_argument("--csv_path", type=str, default="sim_eval_results.csv")
     args = parser.parse_args()
     print(args.save_video)
@@ -53,15 +55,14 @@ def main():
 
     obj_lo = int(args.obj_lo)
     obj_hi = int(args.obj_hi)
-    goal_lo = obj_lo
-    goal_hi = obj_hi
+    goal_lo = int(args.goal_lo)
+    goal_hi = int(args.goal_hi)
 
     header = ["object_id", "goal_id"] + [f"discrete_{i}" for i in range(args.episodes)] + [f"continuous_{i}" for i in range(args.episodes)]
-    csv_path = Path(args.csv_path)
-    if not csv_path.exists():
-        with open(csv_path, "w", newline="", encoding="utf-8") as fh:
-            writer = csv.writer(fh)
-            writer.writerow(header)
+    csv_path = Path(args.save_prefix + args.csv_path)
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
 
     sqrt2 = np.sqrt(2.0)
     for oid in range(obj_lo, obj_hi):
@@ -152,8 +153,8 @@ def main():
             with open(csv_path, "a", newline="", encoding="utf-8") as fh:
                 writer = csv.writer(fh)
                 writer.writerow(row)
-            print(env.picked, env.delivered)
-            print(cont)
+            # print(env.picked, env.delivered)
+            # print(cont)
             disc_success_rate = float(delivered.mean().item()) * 100.0
             mean_cont = float(cont.mean().item())
             print(f"object: {oid} goal: {gid} discrete success rate: {disc_success_rate:.1f}% mean continuous: {mean_cont:.3f}")
